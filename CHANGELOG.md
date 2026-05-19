@@ -1,9 +1,18 @@
+## [0.1.30] - 2026-05-19
+
+### 🐛 Bug Fixes
+
+- Allow localhost virtual-hosted endpoints
 ## [0.1.29] - 2026-05-19
 
 ### 🚀 Features
 
 - [**breaking**] Harden S3 validation and checksums
 - [**breaking**] Tighten S3 request validation and error handling
+
+### ⚙️ Miscellaneous Tasks
+
+- Release s3 version 0.1.29
 ## [0.1.28] - 2026-04-20
 
 ### 🚜 Refactor
