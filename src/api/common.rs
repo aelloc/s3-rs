@@ -1,10 +1,77 @@
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{
+    HeaderMap, HeaderValue, StatusCode,
+    header::{HeaderName, IntoHeaderName},
+};
 
 use crate::error::{Error, Result};
+#[cfg(feature = "multipart")]
+use crate::types::CompletedPart;
 
 pub(crate) const MAX_LIST_OBJECTS_KEYS: u32 = 1_000;
 #[cfg(feature = "multipart")]
 pub(crate) const MAX_LIST_PARTS: u32 = 1_000;
+#[cfg(feature = "multipart")]
+pub(crate) const MAX_UPLOAD_PART_NUMBER: u32 = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ByteRange {
+    start: u64,
+    end_inclusive: u64,
+}
+
+impl ByteRange {
+    pub(crate) const fn new(start: u64, end_inclusive: u64) -> Self {
+        Self {
+            start,
+            end_inclusive,
+        }
+    }
+
+    pub(crate) fn header_value(self, invalid_message: &'static str) -> Result<HeaderValue> {
+        if self.start > self.end_inclusive {
+            return Err(Error::invalid_config(
+                "byte range start must be <= end_inclusive",
+            ));
+        }
+
+        header_value(
+            format!("bytes={}-{}", self.start, self.end_inclusive),
+            invalid_message,
+        )
+    }
+}
+
+pub(crate) fn header_value(
+    value: impl AsRef<str>,
+    invalid_message: &'static str,
+) -> Result<HeaderValue> {
+    HeaderValue::from_str(value.as_ref()).map_err(|_| Error::invalid_config(invalid_message))
+}
+
+pub(crate) fn insert_header<K>(
+    headers: &mut HeaderMap,
+    name: K,
+    value: impl AsRef<str>,
+    invalid_message: &'static str,
+) -> Result<()>
+where
+    K: IntoHeaderName,
+{
+    headers.insert(name, header_value(value, invalid_message)?);
+    Ok(())
+}
+
+pub(crate) fn insert_optional_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: Option<String>,
+    invalid_message: &'static str,
+) -> Result<()> {
+    if let Some(value) = value {
+        insert_header(headers, name, value, invalid_message)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn parse_xml_or_service_error<T>(
     status: StatusCode,
@@ -55,6 +122,59 @@ pub(crate) fn validate_max_parts(max_parts: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "multipart")]
+pub(crate) fn validate_upload_part_number(part_number: u32) -> Result<()> {
+    if part_number == 0 || part_number > MAX_UPLOAD_PART_NUMBER {
+        return Err(Error::invalid_config(
+            "part_number must be in the range 1..=10000",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "multipart")]
+pub(crate) fn validate_upload_id(upload_id: &str) -> Result<()> {
+    if upload_id.is_empty() {
+        return Err(Error::invalid_config("upload_id must not be empty"));
+    }
+    if upload_id.trim() != upload_id {
+        return Err(Error::invalid_config(
+            "upload_id must not include leading or trailing whitespace",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "multipart")]
+pub(crate) fn prepare_completed_parts(mut parts: Vec<CompletedPart>) -> Result<Vec<CompletedPart>> {
+    if parts.is_empty() {
+        return Err(Error::invalid_config(
+            "complete_multipart_upload requires at least one completed part",
+        ));
+    }
+
+    for part in &parts {
+        validate_upload_part_number(part.part_number)?;
+        if part.etag.trim().is_empty() {
+            return Err(Error::invalid_config(
+                "completed part etag must not be empty",
+            ));
+        }
+    }
+
+    parts.sort_by_key(|part| part.part_number);
+    if parts
+        .windows(2)
+        .any(|pair| pair[0].part_number == pair[1].part_number)
+    {
+        return Err(Error::invalid_config(
+            "completed part numbers must be unique",
+        ));
+    }
+
+    Ok(parts)
+}
+
 pub(crate) fn validate_subresource(subresource: &str) -> Result<()> {
     if subresource.trim().is_empty() {
         return Err(Error::invalid_config("subresource must not be empty"));
@@ -68,9 +188,7 @@ pub(crate) fn apply_metadata_headers(
 ) -> Result<()> {
     for (name, value) in metadata {
         let header_name = crate::util::redact::metadata_header_name(&name)?;
-        let value = HeaderValue::from_str(&value)
-            .map_err(|_| Error::invalid_config("invalid metadata header value"))?;
-        headers.insert(header_name, value);
+        insert_header(headers, header_name, value, "invalid metadata header value")?;
     }
     Ok(())
 }
@@ -117,6 +235,87 @@ mod tests {
         assert!(validate_max_parts(1_000).is_ok());
         assert!(validate_max_parts(0).is_err());
         assert!(validate_max_parts(1_001).is_err());
+    }
+
+    #[test]
+    fn byte_range_rejects_reversed_bounds() {
+        let err = ByteRange::new(10, 9)
+            .header_value("invalid Range header")
+            .expect_err("reversed byte range should be rejected");
+
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("byte range")),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn byte_range_formats_http_header_value() {
+        let value = ByteRange::new(3, 9)
+            .header_value("invalid Range header")
+            .expect("range should be valid");
+        assert_eq!(value.to_str().ok(), Some("bytes=3-9"));
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn prepare_completed_parts_sorts_and_validates_parts() {
+        let parts = prepare_completed_parts(vec![
+            CompletedPart {
+                part_number: 2,
+                etag: "etag-2".to_string(),
+            },
+            CompletedPart {
+                part_number: 1,
+                etag: "etag-1".to_string(),
+            },
+        ])
+        .expect("parts should be valid");
+
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[1].part_number, 2);
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn prepare_completed_parts_rejects_invalid_parts() {
+        assert!(prepare_completed_parts(Vec::new()).is_err());
+        assert!(
+            prepare_completed_parts(vec![CompletedPart {
+                part_number: 0,
+                etag: "etag".to_string(),
+            }])
+            .is_err()
+        );
+        assert!(
+            prepare_completed_parts(vec![CompletedPart {
+                part_number: 1,
+                etag: " ".to_string(),
+            }])
+            .is_err()
+        );
+        assert!(
+            prepare_completed_parts(vec![
+                CompletedPart {
+                    part_number: 1,
+                    etag: "etag-1".to_string(),
+                },
+                CompletedPart {
+                    part_number: 1,
+                    etag: "etag-duplicate".to_string(),
+                },
+            ])
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn validate_upload_id_rejects_outer_whitespace() {
+        assert!(validate_upload_id("").is_err());
+        assert!(validate_upload_id(" upload-id").is_err());
+        assert!(validate_upload_id("upload-id ").is_err());
+        assert!(validate_upload_id("upload-id").is_ok());
     }
 
     #[test]

@@ -31,10 +31,11 @@ impl AwsRegion {
     /// Creates a custom region variant.
     pub fn other(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        if value.trim().is_empty() {
+        let value = value.trim();
+        if value.is_empty() {
             return Err(Error::invalid_config("region must not be empty"));
         }
-        Ok(Self::Other(value))
+        Ok(Self::Other(value.to_string()))
     }
 
     /// Returns the region identifier.
@@ -318,6 +319,10 @@ mod tests {
         assert_eq!(
             "unknown-1".parse::<AwsRegion>().unwrap(),
             AwsRegion::Other("unknown-1".to_string())
+        );
+        assert_eq!(
+            AwsRegion::other(" custom-1 ").unwrap(),
+            AwsRegion::Other("custom-1".to_string())
         );
     }
 

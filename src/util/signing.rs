@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use graviola::hashing::{Hash as _, Sha256, hmac::Hmac};
 use http::{HeaderMap, HeaderValue, Method};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
 use crate::{
@@ -85,7 +86,7 @@ pub(crate) fn sign_headers_with_service(
     let host_header_value = host_header_value(&resolved.url)?;
     headers.insert(http::header::HOST, host_header_value);
 
-    let (canonical_headers, signed_headers) = canonicalize_headers(headers);
+    let (canonical_headers, signed_headers) = canonicalize_headers(headers)?;
 
     let canonical_request = canonical_request(
         method,
@@ -145,7 +146,7 @@ pub(crate) fn presign(
 
     let mut signing_headers = headers.clone();
     signing_headers.insert(http::header::HOST, host_header_value(&resolved.url)?);
-    let (canonical_headers, signed_headers) = canonicalize_headers(&signing_headers);
+    let (canonical_headers, signed_headers) = canonicalize_headers(&signing_headers)?;
 
     let amz_date = amz_datetime(params.now);
     let credential_scope = credential_scope(params.region, params.service, params.now);
@@ -209,13 +210,18 @@ fn validate_existing_presign_query_params(
     existing_query_params: &[(String, String)],
 ) -> Result<(), Error> {
     for (name, _) in existing_query_params {
-        let name = name.trim();
-        if name.is_empty() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
             return Err(Error::invalid_config(
                 "presign query parameter name must not be empty",
             ));
         }
-        if name
+        if trimmed != name {
+            return Err(Error::invalid_config(
+                "presign query parameter name must not include leading or trailing whitespace",
+            ));
+        }
+        if trimmed
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-amz-"))
         {
@@ -269,30 +275,29 @@ fn host_header_value(url: &url::Url) -> Result<HeaderValue, Error> {
     HeaderValue::from_str(&host).map_err(|_| Error::signing("invalid host header value"))
 }
 
-fn canonicalize_headers(headers: &HeaderMap) -> (String, String) {
-    let mut pairs = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name_str = name.as_str();
-            if !should_sign_header(name_str) {
-                return None;
-            }
-            let value_str = value.to_str().ok()?;
-            Some((
-                name_str.to_ascii_lowercase(),
-                normalize_header_value(value_str),
-            ))
-        })
-        .collect::<Vec<_>>();
+fn canonicalize_headers(headers: &HeaderMap) -> Result<(String, String), Error> {
+    let mut headers_by_name = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        let name_str = name.as_str();
+        if !should_sign_header(name_str) {
+            continue;
+        }
 
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let value_str = value
+            .to_str()
+            .map_err(|_| Error::signing(format!("invalid {name_str} header value for signing")))?;
+        headers_by_name
+            .entry(name_str.to_ascii_lowercase())
+            .or_default()
+            .push(normalize_header_value(value_str));
+    }
 
     let mut canonical_headers = String::new();
     let mut signed_headers = String::new();
-    for (idx, (name, value)) in pairs.into_iter().enumerate() {
+    for (idx, (name, values)) in headers_by_name.into_iter().enumerate() {
         canonical_headers.push_str(&name);
         canonical_headers.push(':');
-        canonical_headers.push_str(&value);
+        canonical_headers.push_str(&values.join(","));
         canonical_headers.push('\n');
 
         if idx > 0 {
@@ -301,7 +306,7 @@ fn canonicalize_headers(headers: &HeaderMap) -> (String, String) {
         signed_headers.push_str(&name);
     }
 
-    (canonical_headers, signed_headers)
+    Ok((canonical_headers, signed_headers))
 }
 
 fn should_sign_header(name: &str) -> bool {
@@ -472,6 +477,92 @@ mod tests {
     }
 
     #[test]
+    fn signing_rejects_non_utf8_signed_header_values() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Path,
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+
+        let err = sign_headers(
+            &Method::GET,
+            &resolved,
+            &mut headers,
+            &payload_hash_empty(),
+            &region,
+            &creds,
+            now,
+        )
+        .expect_err("non-UTF-8 signed header values must be rejected");
+
+        match err {
+            Error::Signing { message } => assert!(message.contains("content-type")),
+            other => panic!("expected Signing error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_headers_combines_duplicate_signed_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-amz-meta-color", HeaderValue::from_static(" blue "));
+        headers.append("x-amz-meta-color", HeaderValue::from_static("green"));
+
+        let (canonical_headers, signed_headers) = canonicalize_headers(&headers).unwrap();
+
+        assert_eq!(canonical_headers, "x-amz-meta-color:blue,green\n");
+        assert_eq!(signed_headers, "x-amz-meta-color");
+    }
+
+    #[test]
+    fn signing_preserves_ipv6_host_header_brackets() {
+        let endpoint = url::Url::parse("http://[::1]:9000").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds = Credentials::new("AKIDEXAMPLE", "SECRET").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Auto,
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        sign_headers(
+            &Method::GET,
+            &resolved,
+            &mut headers,
+            &payload_hash_empty(),
+            &region,
+            &creds,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok()),
+            Some("[::1]:9000")
+        );
+    }
+
+    #[test]
     fn presign_includes_expected_query_params() {
         let endpoint = url::Url::parse("https://example.com").unwrap();
         let region = Region::new("us-east-1").unwrap();
@@ -584,6 +675,43 @@ mod tests {
         match err {
             Error::InvalidConfig { message } => {
                 assert!(message.contains("reserved x-amz-*"));
+            }
+            other => panic!("expected invalid config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_rejects_query_param_names_with_outer_whitespace() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Path,
+        )
+        .unwrap();
+
+        let err = presign(
+            Method::GET,
+            resolved,
+            SigV4Params::for_s3(&region, &creds, now),
+            Duration::from_secs(60),
+            &[(
+                " response-content-type".to_string(),
+                "text/plain".to_string(),
+            )],
+            &HeaderMap::new(),
+        )
+        .expect_err("query names with outer whitespace must be rejected");
+
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("whitespace"));
             }
             other => panic!("expected invalid config error, got {other:?}"),
         }

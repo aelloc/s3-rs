@@ -37,11 +37,11 @@ graviola = { version = "0.3.4", default-features = false }
 md-5 = { version = "0.11.0", default-features = false }
 
 # Transport backend (feature-gated)
-reqx = { version = "0.1.34", default-features = false, optional = true }
+reqx = { version = "0.1.38", default-features = false, optional = true }
 http-body-util = { version = "0.1.3", default-features = false, optional = true }
 
 # XML and data decoding
-quick-xml = { version = "0.39.2", default-features = false, features = ["serialize"] }
+quick-xml = { version = "0.40.1", default-features = false, features = ["serialize"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"], optional = true }
 
@@ -52,7 +52,7 @@ futures-util = { version = "0.3.32", default-features = false, features = ["std"
 tokio = { version = "1.52.1", default-features = false, features = ["time", "sync", "io-util"], optional = true }
 
 # Optional capabilities
-crc = { version = "3.4.0", default-features = false, optional = true }
+crc-fast = { version = "1.10.0", default-features = false, features = ["std"], optional = true }
 sha1 = { version = "0.11.0", default-features = false, optional = true }
 metrics = { version = "0.24.3", default-features = false, optional = true }
 tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
@@ -85,7 +85,7 @@ tracing = ["dep:tracing"]
 metrics = ["dep:metrics"]
 
 # Optional capabilities
-checksums = ["dep:crc", "dep:sha1"]
+checksums = ["dep:crc-fast", "dep:sha1"]
 multipart = []
 providers = []
 credentials-profile = []

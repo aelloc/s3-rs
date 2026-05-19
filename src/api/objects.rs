@@ -6,9 +6,14 @@ use bytes::Bytes;
 use futures_core::Stream;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
+use super::common::{
+    ByteRange, apply_metadata_headers, insert_header, insert_optional_header,
+    parse_xml_or_service_error, validate_max_keys,
+};
 #[cfg(feature = "multipart")]
-use super::common::validate_max_parts;
-use super::common::{apply_metadata_headers, parse_xml_or_service_error, validate_max_keys};
+use super::common::{
+    prepare_completed_parts, validate_max_parts, validate_upload_id, validate_upload_part_number,
+};
 
 use crate::{
     client::Client,
@@ -21,8 +26,6 @@ use crate::{
 };
 
 const MAX_ERROR_RESPONSE_BODY_BYTES: usize = 256 * 1024;
-#[cfg(feature = "multipart")]
-const MAX_UPLOAD_PART_NUMBER: u32 = 10_000;
 
 #[cfg(feature = "multipart")]
 use crate::types::{
@@ -371,7 +374,7 @@ pub struct GetObjectRequest {
     client: Client,
     bucket: String,
     key: String,
-    range: Option<String>,
+    range: Option<ByteRange>,
     if_match: Option<String>,
     if_none_match: Option<String>,
     if_modified_since: Option<String>,
@@ -381,7 +384,7 @@ pub struct GetObjectRequest {
 impl GetObjectRequest {
     /// Sets an inclusive byte range.
     pub fn range_bytes(mut self, start: u64, end_inclusive: u64) -> Self {
-        self.range = Some(format!("bytes={start}-{end_inclusive}"));
+        self.range = Some(ByteRange::new(start, end_inclusive));
         self
     }
 
@@ -413,9 +416,10 @@ impl GetObjectRequest {
     pub async fn send(self) -> Result<GetObjectOutput> {
         let mut headers = HeaderMap::new();
         if let Some(range) = self.range {
-            let value = HeaderValue::from_str(&range)
-                .map_err(|_| Error::invalid_config("invalid Range header"))?;
-            headers.insert(http::header::RANGE, value);
+            headers.insert(
+                http::header::RANGE,
+                range.header_value("invalid Range header")?,
+            );
         }
         if let Some(value) = self.if_match {
             let value = HeaderValue::from_str(&value)
@@ -660,36 +664,42 @@ impl PutObjectRequest {
     /// Sends the request.
     pub async fn send(self) -> Result<PutObjectOutput> {
         let mut headers = HeaderMap::new();
-        if let Some(ct) = self.content_type {
-            let value = HeaderValue::from_str(&ct)
-                .map_err(|_| Error::invalid_config("invalid Content-Type header"))?;
-            headers.insert(http::header::CONTENT_TYPE, value);
-        }
-        if let Some(value) = self.cache_control {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Cache-Control header"))?;
-            headers.insert(http::header::CACHE_CONTROL, value);
-        }
-        if let Some(value) = self.content_disposition {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Content-Disposition header"))?;
-            headers.insert(http::header::CONTENT_DISPOSITION, value);
-        }
-        if let Some(value) = self.content_encoding {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Content-Encoding header"))?;
-            headers.insert(http::header::CONTENT_ENCODING, value);
-        }
-        if let Some(value) = self.content_language {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Content-Language header"))?;
-            headers.insert(http::header::CONTENT_LANGUAGE, value);
-        }
-        if let Some(value) = self.expires {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Expires header"))?;
-            headers.insert(http::header::EXPIRES, value);
-        }
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_TYPE,
+            self.content_type,
+            "invalid Content-Type header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CACHE_CONTROL,
+            self.cache_control,
+            "invalid Cache-Control header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_DISPOSITION,
+            self.content_disposition,
+            "invalid Content-Disposition header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_ENCODING,
+            self.content_encoding,
+            "invalid Content-Encoding header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_LANGUAGE,
+            self.content_language,
+            "invalid Content-Language header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::EXPIRES,
+            self.expires,
+            "invalid Expires header",
+        )?;
 
         apply_metadata_headers(&mut headers, self.metadata)?;
 
@@ -705,8 +715,7 @@ impl PutObjectRequest {
                 })?;
                 headers.insert(
                     http::header::CONTENT_LENGTH,
-                    HeaderValue::from_str(&content_length.to_string())
-                        .map_err(|_| Error::invalid_config("invalid Content-Length header"))?,
+                    crate::transport::content_length_header_value(content_length)?,
                 );
                 AsyncBody::Stream {
                     stream,
@@ -896,9 +905,12 @@ impl CopyObjectRequest {
             &self.source_key,
             self.source_version_id.as_deref(),
         );
-        let copy_source = HeaderValue::from_str(&copy_source)
-            .map_err(|_| Error::invalid_config("invalid x-amz-copy-source header"))?;
-        headers.insert("x-amz-copy-source", copy_source);
+        insert_header(
+            &mut headers,
+            "x-amz-copy-source",
+            copy_source,
+            "invalid x-amz-copy-source header",
+        )?;
 
         if matches!(self.metadata_directive, Some(MetadataDirective::Replace)) {
             headers.insert(
@@ -907,11 +919,12 @@ impl CopyObjectRequest {
             );
         }
 
-        if let Some(value) = self.content_type {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Content-Type header"))?;
-            headers.insert(http::header::CONTENT_TYPE, value);
-        }
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_TYPE,
+            self.content_type,
+            "invalid Content-Type header",
+        )?;
 
         apply_metadata_headers(&mut headers, self.metadata)?;
 
@@ -975,11 +988,12 @@ impl CreateMultipartUploadRequest {
     /// Sends the request.
     pub async fn send(self) -> Result<CreateMultipartUploadOutput> {
         let mut headers = HeaderMap::new();
-        if let Some(value) = self.content_type {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid Content-Type header"))?;
-            headers.insert(http::header::CONTENT_TYPE, value);
-        }
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_TYPE,
+            self.content_type,
+            "invalid Content-Type header",
+        )?;
 
         apply_metadata_headers(&mut headers, self.metadata)?;
 
@@ -1030,14 +1044,14 @@ impl UploadPartRequest {
         self
     }
 
-    /// Sets the request body from a byte stream.
-    pub fn body_stream<S>(mut self, stream: S) -> Self
+    /// Sets a streaming request body with a known content length.
+    pub fn body_stream_sized<S>(mut self, stream: S, content_length: u64) -> Self
     where
         S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + Sync + 'static,
     {
         self.body = AsyncBody::Stream {
             stream: Box::pin(stream),
-            content_length: None,
+            content_length: Some(content_length),
         };
         self
     }
@@ -1077,26 +1091,23 @@ impl UploadPartRequest {
 
 #[cfg(feature = "multipart")]
 fn validate_upload_part_body(body: &AsyncBody) -> Result<()> {
-    if matches!(body, AsyncBody::Empty) {
-        return Err(Error::invalid_config("upload_part requires a request body"));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "multipart")]
-fn validate_upload_part_number(part_number: u32) -> Result<()> {
-    if part_number == 0 || part_number > MAX_UPLOAD_PART_NUMBER {
-        return Err(Error::invalid_config(
-            "part_number must be in the range 1..=10000",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "multipart")]
-fn validate_upload_id(upload_id: &str) -> Result<()> {
-    if upload_id.trim().is_empty() {
-        return Err(Error::invalid_config("upload_id must not be empty"));
+    match body {
+        AsyncBody::Empty => {
+            return Err(Error::invalid_config("upload_part requires a request body"));
+        }
+        AsyncBody::Stream {
+            content_length: None,
+            ..
+        } => {
+            return Err(Error::invalid_config(
+                "streaming upload_part requires content_length",
+            ));
+        }
+        AsyncBody::Bytes(_)
+        | AsyncBody::Stream {
+            content_length: Some(_),
+            ..
+        } => {}
     }
     Ok(())
 }
@@ -1112,7 +1123,7 @@ pub struct UploadPartCopyRequest {
     destination_key: String,
     upload_id: String,
     part_number: u32,
-    copy_source_range: Option<String>,
+    copy_source_range: Option<ByteRange>,
 }
 
 #[cfg(feature = "multipart")]
@@ -1125,7 +1136,7 @@ impl UploadPartCopyRequest {
 
     /// Sets a byte range for the copy source.
     pub fn copy_source_range_bytes(mut self, start: u64, end_inclusive: u64) -> Self {
-        self.copy_source_range = Some(format!("bytes={start}-{end_inclusive}"));
+        self.copy_source_range = Some(ByteRange::new(start, end_inclusive));
         self
     }
 
@@ -1141,14 +1152,18 @@ impl UploadPartCopyRequest {
             &self.source_key,
             self.source_version_id.as_deref(),
         );
-        let copy_source = HeaderValue::from_str(&copy_source)
-            .map_err(|_| Error::invalid_config("invalid x-amz-copy-source header"))?;
-        headers.insert("x-amz-copy-source", copy_source);
+        insert_header(
+            &mut headers,
+            "x-amz-copy-source",
+            copy_source,
+            "invalid x-amz-copy-source header",
+        )?;
 
         if let Some(range) = self.copy_source_range {
-            let value = HeaderValue::from_str(&range)
-                .map_err(|_| Error::invalid_config("invalid x-amz-copy-source-range header"))?;
-            headers.insert("x-amz-copy-source-range", value);
+            headers.insert(
+                "x-amz-copy-source-range",
+                range.header_value("invalid x-amz-copy-source-range header")?,
+            );
         }
 
         let query = vec![
@@ -1216,7 +1231,9 @@ impl CompleteMultipartUploadRequest {
 
     /// Sends the request.
     pub async fn send(self) -> Result<CompleteMultipartUploadOutput> {
-        let body = crate::util::xml::encode_complete_multipart_upload(&self.parts)?;
+        validate_upload_id(&self.upload_id)?;
+        let parts = prepare_completed_parts(self.parts)?;
+        let body = crate::util::xml::encode_complete_multipart_upload(&parts)?;
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
@@ -1264,6 +1281,8 @@ pub struct AbortMultipartUploadRequest {
 impl AbortMultipartUploadRequest {
     /// Sends the request.
     pub async fn send(self) -> Result<AbortMultipartUploadOutput> {
+        validate_upload_id(&self.upload_id)?;
+
         let resp = self
             .client
             .execute(

@@ -1,9 +1,8 @@
-use std::net::IpAddr;
-
-use url::Url;
+use url::{Host, Url};
 
 use crate::{auth::AddressingStyle, error::Error};
 
+#[derive(Debug)]
 pub(crate) struct ResolvedUrl {
     pub(crate) url: Url,
     pub(crate) canonical_uri: String,
@@ -39,15 +38,13 @@ pub(crate) fn resolve_url(
             canonical_query_string,
         });
     };
-    if bucket.trim().is_empty() {
-        return Err(Error::invalid_config("bucket must not be empty"));
-    }
+    validate_bucket_name(bucket)?;
 
     let host = base_url
         .host_str()
         .ok_or_else(|| Error::invalid_config("endpoint must include host"))?;
 
-    let resolved_style = resolve_addressing_style(base_url, host, bucket, addressing);
+    let resolved_style = resolve_addressing_style(base_url, bucket, addressing);
 
     let (final_host, raw_path) = match resolved_style {
         AddressingStyle::Path => {
@@ -55,9 +52,14 @@ pub(crate) fn resolve_url(
                 Some(key) => format!("/{bucket}/{key}"),
                 None => format!("/{bucket}"),
             };
-            (host.to_string(), raw_path)
+            (None, raw_path)
         }
         AddressingStyle::VirtualHosted => {
+            if endpoint_requires_path_style(base_url) {
+                return Err(Error::invalid_config(
+                    "virtual-hosted-style requires a DNS endpoint host",
+                ));
+            }
             if !is_dns_compatible_bucket(bucket) {
                 return Err(Error::invalid_config(
                     "bucket is not DNS compatible for virtual-hosted-style",
@@ -67,7 +69,7 @@ pub(crate) fn resolve_url(
                 Some(key) if !key.is_empty() => format!("/{key}"),
                 _ => "/".to_string(),
             };
-            (format!("{bucket}.{host}"), raw_path)
+            (Some(format!("{bucket}.{host}")), raw_path)
         }
         AddressingStyle::Auto => {
             return Err(Error::invalid_config(
@@ -79,8 +81,10 @@ pub(crate) fn resolve_url(
     let canonical_uri = crate::util::encode::aws_percent_encode_path(&raw_path);
 
     url.set_path(&canonical_uri);
-    url.set_host(Some(&final_host))
-        .map_err(|_| Error::invalid_config("invalid endpoint host"))?;
+    if let Some(final_host) = final_host {
+        url.set_host(Some(&final_host))
+            .map_err(|_| Error::invalid_config("invalid endpoint host"))?;
+    }
 
     Ok(ResolvedUrl {
         url,
@@ -91,14 +95,13 @@ pub(crate) fn resolve_url(
 
 fn resolve_addressing_style(
     base_url: &Url,
-    host: &str,
     bucket: &str,
     addressing: AddressingStyle,
 ) -> AddressingStyle {
     match addressing {
         AddressingStyle::Path | AddressingStyle::VirtualHosted => addressing,
         AddressingStyle::Auto => {
-            if host == "localhost" || host.parse::<IpAddr>().is_ok() {
+            if endpoint_requires_path_style(base_url) {
                 return AddressingStyle::Path;
             }
 
@@ -113,6 +116,29 @@ fn resolve_addressing_style(
             AddressingStyle::VirtualHosted
         }
     }
+}
+
+fn endpoint_requires_path_style(base_url: &Url) -> bool {
+    match base_url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(_) | Host::Ipv6(_)) => true,
+        None => false,
+    }
+}
+
+fn validate_bucket_name(bucket: &str) -> Result<(), Error> {
+    if bucket.is_empty() {
+        return Err(Error::invalid_config("bucket must not be empty"));
+    }
+    if bucket.trim() != bucket {
+        return Err(Error::invalid_config(
+            "bucket must not include leading or trailing whitespace",
+        ));
+    }
+    if bucket.contains('/') {
+        return Err(Error::invalid_config("bucket must not contain '/'"));
+    }
+    Ok(())
 }
 
 fn is_dns_compatible_bucket(bucket: &str) -> bool {
@@ -140,7 +166,14 @@ fn is_dns_compatible_bucket(bucket: &str) -> bool {
         return false;
     }
 
-    if bucket.parse::<IpAddr>().is_ok() {
+    if bucket
+        .split('.')
+        .any(|label| label.starts_with('-') || label.ends_with('-'))
+    {
+        return false;
+    }
+
+    if bucket.parse::<std::net::IpAddr>().is_ok() {
         return false;
     }
 
@@ -201,6 +234,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_falls_back_to_path_style_for_ip_endpoints() {
+        for endpoint in ["http://127.0.0.1:9000", "http://[::1]:9000"] {
+            let base = Url::parse(endpoint).unwrap();
+            let resolved = resolve_url(
+                &base,
+                Some("mybucket"),
+                Some("key"),
+                &[],
+                AddressingStyle::Auto,
+            )
+            .unwrap();
+
+            assert_eq!(resolved.canonical_uri, "/mybucket/key");
+            assert_eq!(resolved.url.path(), "/mybucket/key");
+            assert_eq!(resolved.url.host(), base.host());
+        }
+    }
+
+    #[test]
+    fn virtual_hosted_style_rejects_local_or_ip_endpoints() {
+        for endpoint in [
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            let base = Url::parse(endpoint).unwrap();
+            let err = resolve_url(
+                &base,
+                Some("mybucket"),
+                Some("key"),
+                &[],
+                AddressingStyle::VirtualHosted,
+            )
+            .expect_err("virtual-hosted-style must require a DNS endpoint");
+
+            assert_invalid_config_contains(err, "DNS endpoint host");
+        }
+    }
+
+    #[test]
+    fn virtual_hosted_style_rejects_invalid_dns_labels() {
+        let base = Url::parse("https://s3.example.com").unwrap();
+        for bucket in ["bad-.bucket", "bad.-bucket"] {
+            let err = resolve_url(
+                &base,
+                Some(bucket),
+                Some("key"),
+                &[],
+                AddressingStyle::VirtualHosted,
+            )
+            .expect_err("invalid DNS labels must be rejected");
+
+            assert_invalid_config_contains(err, "DNS compatible");
+        }
+    }
+
+    #[test]
     fn path_encoding_preserves_slash_in_key() {
         let base = Url::parse("https://example.com").unwrap();
         let resolved = resolve_url(
@@ -237,7 +327,7 @@ mod tests {
     #[test]
     fn empty_bucket_is_rejected() {
         let base = Url::parse("https://example.com").unwrap();
-        let err = match resolve_url(&base, Some("   "), Some("key"), &[], AddressingStyle::Path) {
+        let err = match resolve_url(&base, Some(""), Some("key"), &[], AddressingStyle::Path) {
             Ok(_) => panic!("empty bucket should be rejected"),
             Err(err) => err,
         };
@@ -246,6 +336,26 @@ mod tests {
                 assert!(message.contains("bucket must not be empty"));
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_bucket_names_are_rejected() {
+        let base = Url::parse("https://example.com").unwrap();
+        let cases = [
+            (" bucket", "whitespace"),
+            ("bucket ", "whitespace"),
+            ("a/b", "'/'"),
+        ];
+
+        for (bucket, expected) in cases {
+            let err =
+                match resolve_url(&base, Some(bucket), Some("key"), &[], AddressingStyle::Path) {
+                    Ok(_) => panic!("malformed bucket should be rejected"),
+                    Err(err) => err,
+                };
+
+            assert_invalid_config_contains(err, expected);
         }
     }
 
@@ -266,6 +376,16 @@ mod tests {
             Error::InvalidConfig { message } => {
                 assert!(message.contains("must not include user info"));
             }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    fn assert_invalid_config_contains(err: Error, expected: &str) {
+        match err {
+            Error::InvalidConfig { message } => assert!(
+                message.contains(expected),
+                "expected error message to contain {expected:?}, got {message:?}",
+            ),
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
     }

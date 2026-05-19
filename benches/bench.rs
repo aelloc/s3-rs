@@ -3,6 +3,8 @@ use std::{hint::black_box, time::Duration};
 
 #[cfg(any(feature = "async", feature = "blocking", feature = "checksums"))]
 use criterion::BenchmarkId;
+#[cfg(feature = "checksums")]
+use criterion::Throughput;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "async")]
@@ -136,14 +138,24 @@ fn bench_checksums(c: &mut Criterion) {
     let mut group = c.benchmark_group("checksums");
     group.measurement_time(Duration::from_secs(3));
 
+    let algorithms = [
+        ("crc32", ChecksumAlgorithm::Crc32),
+        ("crc32c", ChecksumAlgorithm::Crc32c),
+        ("crc64nvme", ChecksumAlgorithm::Crc64Nvme),
+    ];
+
     for size in [0usize, 32, 1024, 64 * 1024] {
         let bytes = vec![0xAB; size];
-        group.bench_with_input(BenchmarkId::new("crc32c", size), &bytes, |b, input| {
-            b.iter(|| {
-                let checksum = Checksum::from_bytes(ChecksumAlgorithm::Crc32c, black_box(input));
-                black_box(checksum);
+        group.throughput(Throughput::Bytes(size as u64));
+
+        for (name, algorithm) in algorithms {
+            group.bench_with_input(BenchmarkId::new(name, size), &bytes, |b, input| {
+                b.iter(|| {
+                    let checksum = Checksum::from_bytes(algorithm, black_box(input));
+                    black_box(checksum);
+                });
             });
-        });
+        }
     }
 
     group.finish();

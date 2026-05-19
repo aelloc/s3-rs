@@ -47,10 +47,11 @@ impl Region {
     /// Creates a region from a non-empty string.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        if value.trim().is_empty() {
+        let value = value.trim();
+        if value.is_empty() {
             return Err(Error::invalid_config("region must not be empty"));
         }
-        Ok(Self(value))
+        Ok(Self(value.to_string()))
     }
 
     /// Returns the region string.
@@ -99,12 +100,8 @@ impl Credentials {
         let access_key_id = access_key_id.into();
         let secret_access_key = secret_access_key.into();
 
-        if access_key_id.trim().is_empty() {
-            return Err(Error::invalid_config("access_key_id must not be empty"));
-        }
-        if secret_access_key.trim().is_empty() {
-            return Err(Error::invalid_config("secret_access_key must not be empty"));
-        }
+        validate_credential_field("access_key_id", &access_key_id)?;
+        validate_credential_field("secret_access_key", &secret_access_key)?;
 
         Ok(Self {
             access_key_id,
@@ -116,12 +113,22 @@ impl Credentials {
     /// Attaches a session token for temporary credentials.
     pub fn with_session_token(mut self, session_token: impl Into<String>) -> Result<Self> {
         let session_token = session_token.into();
-        if session_token.trim().is_empty() {
-            return Err(Error::invalid_config("session_token must not be empty"));
-        }
+        validate_credential_field("session_token", &session_token)?;
         self.session_token = Some(session_token);
         Ok(self)
     }
+}
+
+fn validate_credential_field(name: &'static str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::invalid_config(format!("{name} must not be empty")));
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(format!(
+            "{name} must not include leading or trailing whitespace"
+        )));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for Credentials {

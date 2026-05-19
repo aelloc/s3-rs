@@ -6,6 +6,7 @@ use crate::{
 };
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+const MAX_DELETE_OBJECTS: usize = 1_000;
 
 pub(crate) fn parse_error_xml(body: &str) -> Option<xml::XmlError> {
     if body.trim().is_empty() {
@@ -108,8 +109,16 @@ pub(crate) fn parse_bucket_versioning(
     })?;
 
     Ok(types::BucketVersioningConfiguration {
-        status: parsed.status.as_deref().and_then(parse_versioning_status),
-        mfa_delete: parsed.mfa_delete.as_deref().and_then(parse_mfa_delete),
+        status: parsed
+            .status
+            .as_deref()
+            .map(parse_versioning_status)
+            .transpose()?,
+        mfa_delete: parsed
+            .mfa_delete
+            .as_deref()
+            .map(parse_mfa_delete)
+            .transpose()?,
     })
 }
 
@@ -123,37 +132,13 @@ pub(crate) fn parse_bucket_lifecycle(
         )
     })?;
 
-    Ok(types::BucketLifecycleConfiguration {
-        rules: parsed
-            .rules
-            .into_iter()
-            .filter_map(|r| {
-                let status = match r.status.as_str() {
-                    "Enabled" => types::BucketLifecycleStatus::Enabled,
-                    "Disabled" => types::BucketLifecycleStatus::Disabled,
-                    _ => return None,
-                };
+    let rules = parsed
+        .rules
+        .into_iter()
+        .map(parse_lifecycle_rule)
+        .collect::<Result<Vec<_>, _>>()?;
 
-                let prefix = r
-                    .filter
-                    .and_then(|f| f.prefix)
-                    .or(r.prefix)
-                    .filter(|v| !v.is_empty());
-                let (expiration_days, expiration_date) = match r.expiration {
-                    Some(exp) => (exp.days, exp.date),
-                    None => (None, None),
-                };
-
-                Some(types::BucketLifecycleRule {
-                    id: r.id,
-                    status,
-                    prefix,
-                    expiration_days,
-                    expiration_date,
-                })
-            })
-            .collect(),
-    })
+    Ok(types::BucketLifecycleConfiguration { rules })
 }
 
 pub(crate) fn parse_bucket_cors(body: &str) -> Result<types::BucketCorsConfiguration, Error> {
@@ -222,17 +207,8 @@ pub(crate) fn parse_bucket_encryption(
     let rules = parsed
         .rules
         .into_iter()
-        .filter_map(|r| {
-            let apply = r.apply?;
-            Some(types::BucketEncryptionRule {
-                apply: types::ApplyServerSideEncryptionByDefault {
-                    sse_algorithm: parse_sse_algorithm(&apply.sse_algorithm),
-                    kms_master_key_id: apply.kms_master_key_id,
-                },
-                bucket_key_enabled: r.bucket_key_enabled,
-            })
-        })
-        .collect();
+        .map(parse_encryption_rule)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(types::BucketEncryptionConfiguration { rules })
 }
@@ -272,7 +248,7 @@ pub(crate) fn parse_copy_object(body: &str) -> Result<types::CopyObjectOutput, E
     Ok(types::CopyObjectOutput::from(parsed))
 }
 
-#[cfg(feature = "multipart")]
+#[cfg(all(feature = "multipart", any(feature = "async", feature = "blocking")))]
 pub(crate) fn parse_create_multipart_upload(
     body: &str,
 ) -> Result<types::CreateMultipartUploadOutput, Error> {
@@ -286,7 +262,7 @@ pub(crate) fn parse_create_multipart_upload(
     Ok(types::CreateMultipartUploadOutput::from(parsed))
 }
 
-#[cfg(feature = "multipart")]
+#[cfg(all(feature = "multipart", any(feature = "async", feature = "blocking")))]
 pub(crate) fn parse_complete_multipart_upload(
     body: &str,
 ) -> Result<types::CompleteMultipartUploadOutput, Error> {
@@ -300,14 +276,14 @@ pub(crate) fn parse_complete_multipart_upload(
     Ok(types::CompleteMultipartUploadOutput::from(parsed))
 }
 
-#[cfg(feature = "multipart")]
+#[cfg(all(feature = "multipart", any(feature = "async", feature = "blocking")))]
 pub(crate) fn parse_list_parts(body: &str) -> Result<types::ListPartsOutput, Error> {
     let parsed = quick_xml::de::from_str::<xml::XmlListPartsResult>(body)
         .map_err(|e| Error::decode("failed to parse ListParts XML response", Some(Box::new(e))))?;
     Ok(types::ListPartsOutput::from(parsed))
 }
 
-#[cfg(feature = "multipart")]
+#[cfg(all(feature = "multipart", any(feature = "async", feature = "blocking")))]
 pub(crate) fn parse_upload_part_copy(body: &str) -> Result<types::UploadPartCopyOutput, Error> {
     let parsed = quick_xml::de::from_str::<xml::XmlCopyPartResult>(body).map_err(|e| {
         Error::decode(
@@ -319,11 +295,10 @@ pub(crate) fn parse_upload_part_copy(body: &str) -> Result<types::UploadPartCopy
 }
 
 pub(crate) fn encode_create_bucket_configuration(region: &str) -> Result<Bytes, Error> {
-    if region.trim().is_empty() {
-        return Err(Error::invalid_config(
-            "create bucket location constraint must not be empty",
-        ));
-    }
+    let region = non_empty_trimmed(
+        region,
+        "create bucket location constraint must not be empty",
+    )?;
 
     #[derive(serde::Serialize)]
     #[serde(rename = "CreateBucketConfiguration")]
@@ -403,6 +378,11 @@ pub(crate) fn encode_delete_objects(
             "delete_objects requires at least one object",
         ));
     }
+    if objects.len() > MAX_DELETE_OBJECTS {
+        return Err(Error::invalid_config(
+            "delete_objects supports at most 1000 objects per request",
+        ));
+    }
 
     #[derive(serde::Serialize)]
     #[serde(rename = "Delete")]
@@ -476,11 +456,7 @@ pub(crate) fn encode_bucket_versioning(
 pub(crate) fn encode_bucket_lifecycle(
     configuration: &types::BucketLifecycleConfiguration,
 ) -> Result<Bytes, Error> {
-    if configuration.rules.is_empty() {
-        return Err(Error::invalid_config(
-            "bucket lifecycle configuration must include at least one rule",
-        ));
-    }
+    validate_bucket_lifecycle(configuration)?;
 
     #[derive(serde::Serialize)]
     #[serde(rename = "LifecycleConfiguration")]
@@ -557,11 +533,7 @@ pub(crate) fn encode_bucket_lifecycle(
 pub(crate) fn encode_bucket_cors(
     configuration: &types::BucketCorsConfiguration,
 ) -> Result<Bytes, Error> {
-    if configuration.rules.is_empty() {
-        return Err(Error::invalid_config(
-            "bucket cors configuration must include at least one rule",
-        ));
-    }
+    validate_bucket_cors(configuration)?;
 
     #[derive(serde::Serialize)]
     #[serde(rename = "CORSConfiguration")]
@@ -612,6 +584,8 @@ pub(crate) fn encode_bucket_cors(
 }
 
 pub(crate) fn encode_bucket_tagging(tagging: &types::BucketTagging) -> Result<Bytes, Error> {
+    validate_bucket_tagging(tagging)?;
+
     #[derive(serde::Serialize)]
     #[serde(rename = "Tagging")]
     struct XmlOut {
@@ -655,11 +629,7 @@ pub(crate) fn encode_bucket_tagging(tagging: &types::BucketTagging) -> Result<By
 pub(crate) fn encode_bucket_encryption(
     configuration: &types::BucketEncryptionConfiguration,
 ) -> Result<Bytes, Error> {
-    if configuration.rules.is_empty() {
-        return Err(Error::invalid_config(
-            "bucket encryption configuration must include at least one rule",
-        ));
-    }
+    validate_bucket_encryption(configuration)?;
 
     #[derive(serde::Serialize)]
     #[serde(rename = "ServerSideEncryptionConfiguration")]
@@ -745,11 +715,201 @@ pub(crate) fn encode_bucket_public_access_block(
     Ok(Bytes::from(xml))
 }
 
-fn parse_versioning_status(value: &str) -> Option<types::BucketVersioningStatus> {
+fn parse_lifecycle_rule(r: xml::XmlLifecycleRule) -> Result<types::BucketLifecycleRule, Error> {
+    let status = parse_lifecycle_status(&r.status)?;
+    let prefix = r
+        .filter
+        .and_then(|f| f.prefix)
+        .or(r.prefix)
+        .filter(|v| !v.is_empty());
+    let (expiration_days, expiration_date) = match r.expiration {
+        Some(exp) => (exp.days, exp.date),
+        None => (None, None),
+    };
+
+    Ok(types::BucketLifecycleRule {
+        id: r.id,
+        status,
+        prefix,
+        expiration_days,
+        expiration_date,
+    })
+}
+
+fn parse_encryption_rule(
+    r: xml::XmlServerSideEncryptionRule,
+) -> Result<types::BucketEncryptionRule, Error> {
+    let apply = r.apply.ok_or_else(|| {
+        Error::decode(
+            "missing ApplyServerSideEncryptionByDefault in encryption rule",
+            None,
+        )
+    })?;
+
+    Ok(types::BucketEncryptionRule {
+        apply: types::ApplyServerSideEncryptionByDefault {
+            sse_algorithm: parse_sse_algorithm(&apply.sse_algorithm),
+            kms_master_key_id: apply.kms_master_key_id,
+        },
+        bucket_key_enabled: r.bucket_key_enabled,
+    })
+}
+
+fn validate_bucket_lifecycle(
+    configuration: &types::BucketLifecycleConfiguration,
+) -> Result<(), Error> {
+    if configuration.rules.is_empty() {
+        return Err(Error::invalid_config(
+            "bucket lifecycle configuration must include at least one rule",
+        ));
+    }
+
+    for rule in &configuration.rules {
+        if let Some(id) = &rule.id
+            && id.len() > 255
+        {
+            return Err(Error::invalid_config(
+                "bucket lifecycle rule id must be at most 255 bytes",
+            ));
+        }
+        match (rule.expiration_days, rule.expiration_date.as_deref()) {
+            (Some(0), _) => {
+                return Err(Error::invalid_config(
+                    "bucket lifecycle expiration_days must be greater than 0",
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::invalid_config(
+                    "bucket lifecycle expiration must use either days or date, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(Error::invalid_config(
+                    "bucket lifecycle rule must include an expiration",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_bucket_cors(configuration: &types::BucketCorsConfiguration) -> Result<(), Error> {
+    if configuration.rules.is_empty() {
+        return Err(Error::invalid_config(
+            "bucket cors configuration must include at least one rule",
+        ));
+    }
+
+    for rule in &configuration.rules {
+        if rule.allowed_origins.is_empty() {
+            return Err(Error::invalid_config(
+                "bucket cors rule must include at least one allowed origin",
+            ));
+        }
+        if rule.allowed_methods.is_empty() {
+            return Err(Error::invalid_config(
+                "bucket cors rule must include at least one allowed method",
+            ));
+        }
+        if rule
+            .allowed_origins
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(Error::invalid_config(
+                "bucket cors allowed origins must not be empty",
+            ));
+        }
+        if rule
+            .allowed_headers
+            .iter()
+            .any(|value| value.trim().is_empty())
+            || rule
+                .expose_headers
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(Error::invalid_config(
+                "bucket cors header names must not be empty",
+            ));
+        }
+        if rule
+            .allowed_methods
+            .iter()
+            .any(|method| method.as_str().trim().is_empty())
+        {
+            return Err(Error::invalid_config(
+                "bucket cors allowed methods must not be empty",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_bucket_tagging(tagging: &types::BucketTagging) -> Result<(), Error> {
+    if tagging.tags.len() > 50 {
+        return Err(Error::invalid_config(
+            "bucket tagging supports at most 50 tags",
+        ));
+    }
+
+    for tag in &tagging.tags {
+        if tag.key.trim().is_empty() {
+            return Err(Error::invalid_config("bucket tag key must not be empty"));
+        }
+        if tag.key.len() > 128 {
+            return Err(Error::invalid_config(
+                "bucket tag key must be at most 128 bytes",
+            ));
+        }
+        if tag.value.len() > 256 {
+            return Err(Error::invalid_config(
+                "bucket tag value must be at most 256 bytes",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_bucket_encryption(
+    configuration: &types::BucketEncryptionConfiguration,
+) -> Result<(), Error> {
+    if configuration.rules.is_empty() {
+        return Err(Error::invalid_config(
+            "bucket encryption configuration must include at least one rule",
+        ));
+    }
+
+    for rule in &configuration.rules {
+        if matches!(rule.apply.sse_algorithm, types::SseAlgorithm::Aes256)
+            && rule.apply.kms_master_key_id.is_some()
+        {
+            return Err(Error::invalid_config(
+                "bucket encryption KMS master key id requires an AWS KMS algorithm",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn non_empty_trimmed<'a>(value: &'a str, message: &'static str) -> Result<&'a str, Error> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::invalid_config(message));
+    }
+    Ok(value)
+}
+
+fn parse_versioning_status(value: &str) -> Result<types::BucketVersioningStatus, Error> {
     match value {
-        "Enabled" => Some(types::BucketVersioningStatus::Enabled),
-        "Suspended" => Some(types::BucketVersioningStatus::Suspended),
-        _ => None,
+        "Enabled" => Ok(types::BucketVersioningStatus::Enabled),
+        "Suspended" => Ok(types::BucketVersioningStatus::Suspended),
+        _ => Err(Error::decode("unknown bucket versioning status", None)),
     }
 }
 
@@ -760,11 +920,11 @@ fn versioning_status_str(value: types::BucketVersioningStatus) -> &'static str {
     }
 }
 
-fn parse_mfa_delete(value: &str) -> Option<types::BucketMfaDeleteStatus> {
+fn parse_mfa_delete(value: &str) -> Result<types::BucketMfaDeleteStatus, Error> {
     match value {
-        "Enabled" => Some(types::BucketMfaDeleteStatus::Enabled),
-        "Disabled" => Some(types::BucketMfaDeleteStatus::Disabled),
-        _ => None,
+        "Enabled" => Ok(types::BucketMfaDeleteStatus::Enabled),
+        "Disabled" => Ok(types::BucketMfaDeleteStatus::Disabled),
+        _ => Err(Error::decode("unknown bucket MFA delete status", None)),
     }
 }
 
@@ -779,6 +939,14 @@ fn lifecycle_status_str(value: types::BucketLifecycleStatus) -> &'static str {
     match value {
         types::BucketLifecycleStatus::Enabled => "Enabled",
         types::BucketLifecycleStatus::Disabled => "Disabled",
+    }
+}
+
+fn parse_lifecycle_status(value: &str) -> Result<types::BucketLifecycleStatus, Error> {
+    match value {
+        "Enabled" => Ok(types::BucketLifecycleStatus::Enabled),
+        "Disabled" => Ok(types::BucketLifecycleStatus::Disabled),
+        _ => Err(Error::decode("unknown bucket lifecycle rule status", None)),
     }
 }
 
@@ -931,6 +1099,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_bucket_versioning_rejects_unknown_status() {
+        let xml = r#"
+<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Status>Unknown</Status>
+</VersioningConfiguration>
+"#;
+
+        assert_decode_error(parse_bucket_versioning(xml), "versioning status");
+    }
+
+    #[test]
     fn parses_bucket_lifecycle() {
         let xml = r#"
 <LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -954,6 +1133,19 @@ mod tests {
         assert_eq!(r.status, types::BucketLifecycleStatus::Enabled);
         assert_eq!(r.prefix.as_deref(), Some("logs/"));
         assert_eq!(r.expiration_days, Some(30));
+    }
+
+    #[test]
+    fn parse_bucket_lifecycle_rejects_unknown_status() {
+        let xml = r#"
+<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <Status>Paused</Status>
+  </Rule>
+</LifecycleConfiguration>
+"#;
+
+        assert_decode_error(parse_bucket_lifecycle(xml), "lifecycle rule status");
     }
 
     #[test]
@@ -1036,6 +1228,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_bucket_encryption_rejects_missing_apply() {
+        let xml = r#"
+<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <BucketKeyEnabled>true</BucketKeyEnabled>
+  </Rule>
+</ServerSideEncryptionConfiguration>
+"#;
+
+        assert_decode_error(
+            parse_bucket_encryption(xml),
+            "ApplyServerSideEncryptionByDefault",
+        );
+    }
+
+    #[test]
     fn parses_bucket_public_access_block() {
         let xml = r#"
 <PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1110,6 +1318,21 @@ mod tests {
     }
 
     #[test]
+    fn encode_delete_objects_rejects_oversized_batches() {
+        let objects = (0..=MAX_DELETE_OBJECTS)
+            .map(|idx| DeleteObjectIdentifier::new(format!("key-{idx}")))
+            .collect::<Vec<_>>();
+
+        let err = encode_delete_objects(&objects, false)
+            .expect_err("delete_objects must reject batches over 1000 objects");
+
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("at most 1000")),
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn encodes_bucket_versioning() {
         let cfg = types::BucketVersioningConfiguration {
             status: Some(types::BucketVersioningStatus::Enabled),
@@ -1125,7 +1348,7 @@ mod tests {
 
     #[test]
     fn encodes_create_bucket_configuration() {
-        let xml = encode_create_bucket_configuration("eu-central-1").unwrap();
+        let xml = encode_create_bucket_configuration(" eu-central-1 ").unwrap();
         let xml = String::from_utf8_lossy(&xml).to_string();
         assert!(xml.contains("<CreateBucketConfiguration"));
         assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
@@ -1155,6 +1378,33 @@ mod tests {
     }
 
     #[test]
+    fn encode_bucket_lifecycle_rejects_invalid_expiration() {
+        let mut rule = types::BucketLifecycleRule {
+            id: None,
+            status: types::BucketLifecycleStatus::Enabled,
+            prefix: Some("logs/".to_string()),
+            expiration_days: None,
+            expiration_date: None,
+        };
+
+        let cfg = types::BucketLifecycleConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "must include an expiration");
+
+        rule.expiration_days = Some(0);
+        let cfg = types::BucketLifecycleConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "greater than 0");
+
+        rule.expiration_days = Some(30);
+        rule.expiration_date = Some("2026-01-01T00:00:00Z".to_string());
+        let cfg = types::BucketLifecycleConfiguration { rules: vec![rule] };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "either days or date");
+    }
+
+    #[test]
     fn encodes_bucket_cors() {
         let cfg = types::BucketCorsConfiguration {
             rules: vec![types::BucketCorsRule {
@@ -1176,6 +1426,33 @@ mod tests {
     }
 
     #[test]
+    fn encode_bucket_cors_rejects_empty_required_lists() {
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![types::BucketCorsRule {
+                id: None,
+                allowed_origins: Vec::new(),
+                allowed_methods: vec![types::CorsMethod::Get],
+                allowed_headers: Vec::new(),
+                expose_headers: Vec::new(),
+                max_age_seconds: None,
+            }],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "allowed origin");
+
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![types::BucketCorsRule {
+                id: None,
+                allowed_origins: vec!["*".to_string()],
+                allowed_methods: Vec::new(),
+                allowed_headers: Vec::new(),
+                expose_headers: Vec::new(),
+                max_age_seconds: None,
+            }],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "allowed method");
+    }
+
+    #[test]
     fn encodes_bucket_tagging() {
         let cfg = types::BucketTagging {
             tags: vec![types::Tag {
@@ -1188,6 +1465,27 @@ mod tests {
         assert!(xml.contains("<Tagging"));
         assert!(xml.contains("<Key>k</Key>"));
         assert!(xml.contains("<Value>v</Value>"));
+    }
+
+    #[test]
+    fn encode_bucket_tagging_rejects_invalid_tags() {
+        let cfg = types::BucketTagging {
+            tags: vec![types::Tag {
+                key: " ".to_string(),
+                value: "v".to_string(),
+            }],
+        };
+        assert_invalid_config(encode_bucket_tagging(&cfg), "tag key");
+
+        let cfg = types::BucketTagging {
+            tags: (0..51)
+                .map(|idx| types::Tag {
+                    key: format!("k-{idx}"),
+                    value: "v".to_string(),
+                })
+                .collect(),
+        };
+        assert_invalid_config(encode_bucket_tagging(&cfg), "at most 50");
     }
 
     #[test]
@@ -1207,6 +1505,21 @@ mod tests {
         assert!(xml.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
         assert!(xml.contains("<KMSMasterKeyID>key-id</KMSMasterKeyID>"));
         assert!(xml.contains("<BucketKeyEnabled>true</BucketKeyEnabled>"));
+    }
+
+    #[test]
+    fn encode_bucket_encryption_rejects_kms_key_with_aes256() {
+        let cfg = types::BucketEncryptionConfiguration {
+            rules: vec![types::BucketEncryptionRule {
+                apply: types::ApplyServerSideEncryptionByDefault {
+                    sse_algorithm: types::SseAlgorithm::Aes256,
+                    kms_master_key_id: Some("key-id".to_string()),
+                },
+                bucket_key_enabled: None,
+            }],
+        };
+
+        assert_invalid_config(encode_bucket_encryption(&cfg), "AWS KMS algorithm");
     }
 
     #[test]
@@ -1242,5 +1555,27 @@ mod tests {
         assert!(xml.contains("<CompleteMultipartUpload"));
         assert!(xml.contains("<PartNumber>1</PartNumber>"));
         assert!(xml.contains("<ETag>\"etag1\"</ETag>"));
+    }
+
+    fn assert_decode_error<T>(result: Result<T, Error>, expected: &str) {
+        match result {
+            Err(Error::Decode { message, .. }) => assert!(
+                message.contains(expected),
+                "expected error message to contain {expected:?}, got {message:?}",
+            ),
+            Err(other) => panic!("expected Decode error, got {other:?}"),
+            Ok(_) => panic!("expected Decode error"),
+        }
+    }
+
+    fn assert_invalid_config<T>(result: Result<T, Error>, expected: &str) {
+        match result {
+            Err(Error::InvalidConfig { message }) => assert!(
+                message.contains(expected),
+                "expected error message to contain {expected:?}, got {message:?}",
+            ),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig"),
+        }
     }
 }

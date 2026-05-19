@@ -197,11 +197,14 @@ pub struct PutObjectOutput {
 #[cfg(feature = "checksums")]
 /// Supported checksum algorithms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChecksumAlgorithm {
     /// CRC32 (ISO HDLC).
     Crc32,
     /// CRC32C (Castagnoli).
     Crc32c,
+    /// CRC64 NVME.
+    Crc64Nvme,
     /// SHA-1.
     Sha1,
     /// SHA-256.
@@ -215,6 +218,7 @@ impl ChecksumAlgorithm {
         match self {
             Self::Crc32 => http::header::HeaderName::from_static("x-amz-checksum-crc32"),
             Self::Crc32c => http::header::HeaderName::from_static("x-amz-checksum-crc32c"),
+            Self::Crc64Nvme => http::header::HeaderName::from_static("x-amz-checksum-crc64nvme"),
             Self::Sha1 => http::header::HeaderName::from_static("x-amz-checksum-sha1"),
             Self::Sha256 => http::header::HeaderName::from_static("x-amz-checksum-sha256"),
         }
@@ -248,13 +252,15 @@ impl Checksum {
         let bytes = bytes.as_ref();
         let value = match algorithm {
             ChecksumAlgorithm::Crc32 => {
-                const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
-                let checksum = CRC32.checksum(bytes).to_be_bytes();
+                let checksum = crc_fast::crc32_iso_hdlc(bytes).to_be_bytes();
                 base64::engine::general_purpose::STANDARD.encode(checksum)
             }
             ChecksumAlgorithm::Crc32c => {
-                const CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
-                let checksum = CRC32C.checksum(bytes).to_be_bytes();
+                let checksum = crc_fast::crc32_iscsi(bytes).to_be_bytes();
+                base64::engine::general_purpose::STANDARD.encode(checksum)
+            }
+            ChecksumAlgorithm::Crc64Nvme => {
+                let checksum = crc_fast::crc64_nvme(bytes).to_be_bytes();
                 base64::engine::general_purpose::STANDARD.encode(checksum)
             }
             ChecksumAlgorithm::Sha1 => {
@@ -772,6 +778,7 @@ pub struct DeleteBucketPublicAccessBlockOutput;
 #[cfg(all(test, feature = "checksums"))]
 mod checksum_tests {
     use super::{Checksum, ChecksumAlgorithm};
+    use http::HeaderMap;
 
     #[test]
     fn from_bytes_matches_known_vectors() {
@@ -793,5 +800,71 @@ mod checksum_tests {
             Checksum::from_bytes(ChecksumAlgorithm::Crc32c, bytes).value,
             "mnG7TA=="
         );
+    }
+
+    #[test]
+    fn crc_from_bytes_matches_standard_vectors() {
+        let cases: &[(ChecksumAlgorithm, &[u8], &str)] = &[
+            (ChecksumAlgorithm::Crc32, b"123456789", "y/Q5Jg=="),
+            (ChecksumAlgorithm::Crc32c, b"123456789", "4waSgw=="),
+            (ChecksumAlgorithm::Crc64Nvme, b"123456789", "rosUhgp5mIg="),
+            (ChecksumAlgorithm::Crc32, b"", "AAAAAA=="),
+            (ChecksumAlgorithm::Crc32c, b"", "AAAAAA=="),
+            (ChecksumAlgorithm::Crc64Nvme, b"", "AAAAAAAAAAA="),
+        ];
+
+        for &(algorithm, bytes, expected) in cases {
+            let checksum = Checksum::from_bytes(algorithm, bytes);
+
+            assert_eq!(checksum.algorithm, algorithm);
+            assert_eq!(checksum.value, expected);
+        }
+    }
+
+    #[test]
+    fn checksum_algorithms_use_s3_header_names() {
+        let cases = [
+            (ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
+            (ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
+            (ChecksumAlgorithm::Crc64Nvme, "x-amz-checksum-crc64nvme"),
+            (ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
+            (ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
+        ];
+
+        for (algorithm, expected) in cases {
+            assert_eq!(algorithm.header_name().as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn apply_writes_checksum_header() {
+        let cases = [
+            (ChecksumAlgorithm::Crc32, "x-amz-checksum-crc32"),
+            (ChecksumAlgorithm::Crc32c, "x-amz-checksum-crc32c"),
+            (ChecksumAlgorithm::Crc64Nvme, "x-amz-checksum-crc64nvme"),
+            (ChecksumAlgorithm::Sha1, "x-amz-checksum-sha1"),
+            (ChecksumAlgorithm::Sha256, "x-amz-checksum-sha256"),
+        ];
+
+        for (algorithm, header_name) in cases {
+            let mut headers = HeaderMap::new();
+            Checksum::new(algorithm, "checksum-value")
+                .apply(&mut headers)
+                .expect("checksum header should be valid");
+
+            let value = headers
+                .get(header_name)
+                .expect("checksum header should be present");
+            assert_eq!(value.to_str().ok(), Some("checksum-value"));
+        }
+    }
+
+    #[test]
+    fn apply_rejects_invalid_header_value() {
+        let mut headers = HeaderMap::new();
+        let result = Checksum::new(ChecksumAlgorithm::Crc32, "invalid\nvalue").apply(&mut headers);
+
+        assert!(result.is_err());
+        assert!(headers.is_empty());
     }
 }
