@@ -55,9 +55,9 @@ pub(crate) fn resolve_url(
             (None, raw_path)
         }
         AddressingStyle::VirtualHosted => {
-            if endpoint_requires_path_style(base_url) {
+            if endpoint_has_ip_host(base_url) {
                 return Err(Error::invalid_config(
-                    "virtual-hosted-style requires a DNS endpoint host",
+                    "virtual-hosted-style requires a domain endpoint host",
                 ));
             }
             if !is_dns_compatible_bucket(bucket) {
@@ -124,6 +124,10 @@ fn endpoint_requires_path_style(base_url: &Url) -> bool {
         Some(Host::Ipv4(_) | Host::Ipv6(_)) => true,
         None => false,
     }
+}
+
+fn endpoint_has_ip_host(base_url: &Url) -> bool {
+    matches!(base_url.host(), Some(Host::Ipv4(_) | Host::Ipv6(_)))
 }
 
 fn validate_bucket_name(bucket: &str) -> Result<(), Error> {
@@ -253,12 +257,24 @@ mod tests {
     }
 
     #[test]
-    fn virtual_hosted_style_rejects_local_or_ip_endpoints() {
-        for endpoint in [
-            "http://localhost:9000",
-            "http://127.0.0.1:9000",
-            "http://[::1]:9000",
-        ] {
+    fn virtual_hosted_style_allows_localhost_domain_endpoints() {
+        let base = Url::parse("http://localhost:9000").unwrap();
+        let resolved = resolve_url(
+            &base,
+            Some("mybucket"),
+            Some("key"),
+            &[],
+            AddressingStyle::VirtualHosted,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.url.host_str().unwrap(), "mybucket.localhost");
+        assert_eq!(resolved.canonical_uri, "/key");
+    }
+
+    #[test]
+    fn virtual_hosted_style_rejects_ip_endpoints() {
+        for endpoint in ["http://127.0.0.1:9000", "http://[::1]:9000"] {
             let base = Url::parse(endpoint).unwrap();
             let err = resolve_url(
                 &base,
@@ -267,9 +283,9 @@ mod tests {
                 &[],
                 AddressingStyle::VirtualHosted,
             )
-            .expect_err("virtual-hosted-style must require a DNS endpoint");
+            .expect_err("virtual-hosted-style must require a domain endpoint");
 
-            assert_invalid_config_contains(err, "DNS endpoint host");
+            assert_invalid_config_contains(err, "domain endpoint host");
         }
     }
 
