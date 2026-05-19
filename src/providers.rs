@@ -31,11 +31,15 @@ impl AwsRegion {
     /// Creates a custom region variant.
     pub fn other(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        let value = value.trim();
         if value.is_empty() {
             return Err(Error::invalid_config("region must not be empty"));
         }
-        Ok(Self::Other(value.to_string()))
+        if value.trim() != value {
+            return Err(Error::invalid_config(
+                "region must not include leading or trailing whitespace",
+            ));
+        }
+        Ok(Self::Other(value))
     }
 
     /// Returns the region identifier.
@@ -54,9 +58,13 @@ impl std::str::FromStr for AwsRegion {
     type Err = Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        let value = value.trim();
         if value.is_empty() {
             return Err(Error::invalid_config("region must not be empty"));
+        }
+        if value.trim() != value {
+            return Err(Error::invalid_config(
+                "region must not include leading or trailing whitespace",
+            ));
         }
         Ok(match value {
             "us-east-1" => Self::UsEast1,
@@ -95,7 +103,12 @@ impl std::str::FromStr for R2Jurisdiction {
     type Err = Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        if value.trim() != value {
+            return Err(Error::invalid_config(
+                "R2 jurisdiction must not include leading or trailing whitespace",
+            ));
+        }
+        match value.to_ascii_lowercase().as_str() {
             "eu" => Ok(Self::Eu),
             "fedramp" => Ok(Self::Fedramp),
             _ => Err(Error::invalid_config(
@@ -171,9 +184,14 @@ impl Preset {
 
 /// Builds a preset for AWS S3.
 pub fn aws_s3(region: impl AsRef<str>) -> Result<Preset> {
-    let region = region.as_ref().trim();
+    let region = region.as_ref();
     if region.is_empty() {
         return Err(Error::invalid_config("region must not be empty"));
+    }
+    if region.trim() != region {
+        return Err(Error::invalid_config(
+            "region must not include leading or trailing whitespace",
+        ));
     }
 
     let suffix = if region.starts_with("cn-") {
@@ -207,9 +225,14 @@ pub fn aws_s3_region(region: AwsRegion) -> Result<Preset> {
 ///
 /// This preset uses region `auto` and path-style addressing.
 pub fn cloudflare_r2(account_id: impl AsRef<str>, endpoint: R2Endpoint) -> Result<Preset> {
-    let account_id = account_id.as_ref().trim();
+    let account_id = account_id.as_ref();
     if account_id.is_empty() {
         return Err(Error::invalid_config("account_id must not be empty"));
+    }
+    if account_id.trim() != account_id {
+        return Err(Error::invalid_config(
+            "account_id must not include leading or trailing whitespace",
+        ));
     }
 
     let invalid = account_id.starts_with('-')
@@ -320,15 +343,20 @@ mod tests {
             "unknown-1".parse::<AwsRegion>().unwrap(),
             AwsRegion::Other("unknown-1".to_string())
         );
-        assert_eq!(
-            AwsRegion::other(" custom-1 ").unwrap(),
-            AwsRegion::Other("custom-1".to_string())
-        );
+        assert!(AwsRegion::other(" custom-1 ").is_err());
+        assert!(" custom-1 ".parse::<AwsRegion>().is_err());
     }
 
     #[test]
     fn aws_s3_region_works() {
         let preset = aws_s3_region(AwsRegion::UsEast1).unwrap();
         assert_eq!(preset.endpoint(), "https://s3.amazonaws.com");
+    }
+
+    #[test]
+    fn presets_reject_outer_whitespace() {
+        assert!(aws_s3(" us-east-1").is_err());
+        assert!(cloudflare_r2(" 123", R2Endpoint::Global).is_err());
+        assert!(" eu".parse::<R2Jurisdiction>().is_err());
     }
 }

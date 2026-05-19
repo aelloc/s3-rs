@@ -124,6 +124,16 @@ pub(crate) fn prepare_user_agent(
     user_agent: Option<String>,
 ) -> crate::error::Result<(String, http::HeaderValue)> {
     let user_agent_text = user_agent.unwrap_or_else(default_user_agent);
+    if user_agent_text.is_empty() {
+        return Err(crate::error::Error::invalid_config(
+            "User-Agent must not be empty",
+        ));
+    }
+    if user_agent_text.trim() != user_agent_text {
+        return Err(crate::error::Error::invalid_config(
+            "User-Agent must not include leading or trailing whitespace",
+        ));
+    }
     let user_agent = http::HeaderValue::from_str(&user_agent_text)
         .map_err(|_| crate::error::Error::invalid_config("invalid User-Agent header"))?;
     Ok((user_agent_text, user_agent))
@@ -175,12 +185,13 @@ pub(crate) fn reqx_retry_policy(config: RetryConfig) -> RetryPolicy {
     } else {
         config.base_delay
     };
-    let max_backoff = config.max_delay.max(config.max_retry_after);
+    let max_backoff = config.max_delay.max(base_backoff);
 
     RetryPolicy::standard()
         .max_attempts(config.max_attempts as usize)
         .base_backoff(base_backoff)
         .max_backoff(max_backoff)
+        .retryable_status_codes([])
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
@@ -331,11 +342,24 @@ fn next_jitter_u64() -> u64 {
 
 #[cfg(any(feature = "async", feature = "blocking"))]
 fn request_id_from_headers(headers: &http::HeaderMap) -> Option<String> {
-    headers
-        .get("x-amz-request-id")
-        .or_else(|| headers.get("x-request-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string())
+    header_text_from_headers(headers, &["x-amz-request-id", "x-request-id"])
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn host_id_from_headers(headers: &http::HeaderMap) -> Option<String> {
+    header_text_from_headers(headers, &["x-amz-id-2", "x-amz-host-id"])
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn header_text_from_headers(headers: &http::HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 #[cfg(any(test, feature = "async", feature = "blocking"))]
@@ -465,41 +489,43 @@ fn response_error_from_parts(
     body: &str,
 ) -> crate::error::Error {
     let request_id = request_id_from_headers(headers);
+    let header_host_id = host_id_from_headers(headers);
     let snippet = crate::util::text::truncate_snippet(body, 4096);
+    let is_rate_limited = status == http::StatusCode::TOO_MANY_REQUESTS
+        || parsed
+            .as_ref()
+            .and_then(|parsed| parsed.code.as_deref())
+            .is_some_and(crate::error::is_rate_limited_service_error_code);
 
-    match (status, parsed) {
-        (http::StatusCode::TOO_MANY_REQUESTS, Some(parsed)) => crate::error::Error::RateLimited {
-            retry_after: retry_after_from_headers(headers),
-            request_id: parsed.request_id.or(request_id),
-            code: parsed.code,
-            message: parsed.message,
-            host_id: parsed.host_id,
-            body_snippet: Some(snippet),
-        },
-        (http::StatusCode::TOO_MANY_REQUESTS, None) => crate::error::Error::RateLimited {
-            retry_after: retry_after_from_headers(headers),
-            request_id,
-            code: None,
-            message: None,
-            host_id: None,
-            body_snippet: Some(snippet),
-        },
-        (status, Some(parsed)) => crate::error::Error::Api {
+    let (code, message, parsed_request_id, parsed_host_id) = match parsed {
+        Some(parsed) => (
+            parsed.code,
+            parsed.message,
+            parsed.request_id,
+            parsed.host_id,
+        ),
+        None => (None, None, None, None),
+    };
+
+    if is_rate_limited {
+        return crate::error::Error::RateLimited {
             status,
-            code: parsed.code,
-            message: parsed.message,
-            request_id: parsed.request_id.or(request_id),
-            host_id: parsed.host_id,
+            retry_after: retry_after_from_headers(headers),
+            request_id: parsed_request_id.or(request_id),
+            code,
+            message,
+            host_id: parsed_host_id.or(header_host_id),
             body_snippet: Some(snippet),
-        },
-        (status, None) => crate::error::Error::Api {
-            status,
-            code: None,
-            message: None,
-            request_id,
-            host_id: None,
-            body_snippet: Some(snippet),
-        },
+        };
+    }
+
+    crate::error::Error::Api {
+        status,
+        code,
+        message,
+        request_id: parsed_request_id.or(request_id),
+        host_id: parsed_host_id.or(header_host_id),
+        body_snippet: Some(snippet),
     }
 }
 
@@ -524,23 +550,48 @@ pub(crate) fn service_error_action(
     retry: RetryConfig,
     attempt: u32,
     max_attempts: u32,
+    method: &Method,
     status: http::StatusCode,
     headers: &http::HeaderMap,
     body: &str,
 ) -> Option<ServiceErrorAction> {
-    let err = response_service_error(status, headers, body)?;
+    if let Some(err) = response_service_error(status, headers, body) {
+        if attempt < max_attempts && err.is_retryable() {
+            return Some(ServiceErrorAction::RetryAfter(retry_delay_from_response(
+                retry, attempt, status, headers,
+            )));
+        }
 
-    if attempt < max_attempts && err.is_retryable() {
+        if status.is_success() {
+            return Some(ServiceErrorAction::ReturnErr(err));
+        }
+
+        return None;
+    }
+
+    if attempt < max_attempts
+        && method_allows_status_retry(method)
+        && is_retryable_http_status(status)
+    {
         return Some(ServiceErrorAction::RetryAfter(retry_delay_from_response(
             retry, attempt, status, headers,
         )));
     }
 
-    if status.is_success() {
-        return Some(ServiceErrorAction::ReturnErr(err));
-    }
-
     None
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn method_allows_status_retry(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE
+    )
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn is_retryable_http_status(status: http::StatusCode) -> bool {
+    status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
@@ -1054,6 +1105,15 @@ mod tests {
         assert_eq!(cfg.max_retry_after, Duration::from_secs(30));
     }
 
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn prepare_user_agent_rejects_blank_or_ambiguous_values() {
+        assert!(prepare_user_agent(Some(String::new())).is_err());
+        assert!(prepare_user_agent(Some(" s3-client".to_string())).is_err());
+        assert!(prepare_user_agent(Some("s3-client ".to_string())).is_err());
+        assert!(prepare_user_agent(Some("s3-client".to_string())).is_ok());
+    }
+
     #[test]
     fn jitter_millis_produces_varying_values() {
         let mut seen = BTreeSet::new();
@@ -1257,6 +1317,33 @@ mod tests {
                 assert!(host_id.is_none());
             }
             other => panic!("expected RateLimited for 429, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn response_error_from_status_uses_header_request_and_host_ids() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-amz-request-id",
+            http::HeaderValue::from_static(" req-header "),
+        );
+        headers.insert(
+            "x-amz-id-2",
+            http::HeaderValue::from_static(" host-header "),
+        );
+
+        match response_error_from_status(http::StatusCode::FORBIDDEN, &headers, "plain error body")
+        {
+            crate::error::Error::Api {
+                request_id,
+                host_id,
+                ..
+            } => {
+                assert_eq!(request_id.as_deref(), Some("req-header"));
+                assert_eq!(host_id.as_deref(), Some("host-header"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
         }
     }
 
@@ -1467,7 +1554,13 @@ mod tests {
         let err =
             response_service_error(http::StatusCode::BAD_REQUEST, &http::HeaderMap::new(), body)
                 .expect("expected embedded service error");
-        assert!(err.is_retryable());
+        match err {
+            crate::error::Error::RateLimited { status, code, .. } => {
+                assert_eq!(status, http::StatusCode::BAD_REQUEST);
+                assert_eq!(code.as_deref(), Some("SlowDown"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     #[cfg(all(

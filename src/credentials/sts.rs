@@ -25,6 +25,8 @@ pub(crate) async fn assume_role_async(
 ) -> Result<CredentialsSnapshot, Error> {
     use std::time::Duration;
 
+    validate_assume_role_inputs(&role_arn, &role_session_name)?;
+
     let endpoint = sts_regional_endpoint(&region)?;
     let body = form_body(&[
         ("Action", "AssumeRole"),
@@ -74,6 +76,8 @@ pub(crate) fn assume_role_blocking(
     tls_root_store: TlsRootStore,
 ) -> Result<CredentialsSnapshot, Error> {
     use std::time::Duration;
+
+    validate_assume_role_inputs(&role_arn, &role_session_name)?;
 
     let endpoint = sts_regional_endpoint(&region)?;
     let body = form_body(&[
@@ -268,7 +272,12 @@ enum StsRegionalEndpointsMode {
 
 impl StsRegionalEndpointsMode {
     fn parse(value: &str) -> Result<Self, Error> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        if value.trim() != value {
+            return Err(Error::invalid_config(
+                "AWS_STS_REGIONAL_ENDPOINTS must not include leading or trailing whitespace",
+            ));
+        }
+        match value.to_ascii_lowercase().as_str() {
             "legacy" => Ok(Self::Legacy),
             "regional" => Ok(Self::Regional),
             _ => Err(Error::invalid_config(
@@ -283,18 +292,28 @@ fn sts_regional_endpoints_mode_from_env() -> Result<Option<StsRegionalEndpointsM
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
-    if value.trim().is_empty() {
+    if value.is_empty() {
         return Ok(None);
     }
     StsRegionalEndpointsMode::parse(&value).map(Some)
 }
 
-fn web_identity_region_from_env() -> Option<String> {
-    std::env::var("AWS_REGION")
+fn web_identity_region_from_env() -> Result<Option<String>, Error> {
+    let value = std::env::var("AWS_REGION")
         .ok()
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok());
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(
+            "AWS_REGION or AWS_DEFAULT_REGION must not include leading or trailing whitespace",
+        ));
+    }
+    Ok(Some(value))
 }
 
 fn partition_from_role_arn(role_arn: &str) -> Option<&str> {
@@ -317,7 +336,7 @@ fn partition_from_role_arn(role_arn: &str) -> Option<&str> {
 
 fn web_identity_sts_endpoint(role_arn: &str) -> Result<url::Url, Error> {
     let partition = partition_from_role_arn(role_arn);
-    let region = web_identity_region_from_env();
+    let region = web_identity_region_from_env()?;
     let mode = sts_regional_endpoints_mode_from_env()?;
     resolve_web_identity_sts_endpoint(partition, region.as_deref(), mode)
 }
@@ -356,6 +375,8 @@ fn web_identity_env() -> Result<(String, String, String), Error> {
     let session_name =
         std::env::var("AWS_ROLE_SESSION_NAME").unwrap_or_else(|_| "s3-session".to_string());
 
+    validate_assume_role_inputs(&role_arn, &session_name)?;
+
     let token = std::fs::read_to_string(token_file)
         .map_err(|e| Error::invalid_config(format!("failed to read web identity token: {e}")))?;
     let token = token.trim().to_string();
@@ -364,6 +385,39 @@ fn web_identity_env() -> Result<(String, String, String), Error> {
     }
 
     Ok((role_arn, session_name, token))
+}
+
+fn validate_assume_role_inputs(role_arn: &str, role_session_name: &str) -> Result<(), Error> {
+    validate_non_empty_no_outer_whitespace("role_arn", role_arn)?;
+    validate_non_empty_no_outer_whitespace("role_session_name", role_session_name)?;
+
+    let len = role_session_name.len();
+    if !(2..=64).contains(&len) {
+        return Err(Error::invalid_config(
+            "role_session_name must be 2..=64 bytes",
+        ));
+    }
+    if !role_session_name.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'=' | b',' | b'.' | b'@' | b'-')
+    }) {
+        return Err(Error::invalid_config(
+            "role_session_name contains characters not allowed by STS",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty_no_outer_whitespace(name: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::invalid_config(format!("{name} must not be empty")));
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(format!(
+            "{name} must not include leading or trailing whitespace"
+        )));
+    }
+    Ok(())
 }
 
 fn form_body(params: &[(&str, &str)]) -> String {
@@ -627,6 +681,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_web_identity_sts_endpoint_rejects_region_outer_whitespace() {
+        let err = resolve_web_identity_sts_endpoint(
+            Some("aws"),
+            Some(" eu-west-1"),
+            Some(StsRegionalEndpointsMode::Regional),
+        )
+        .expect_err("region whitespace must be rejected");
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("region")),
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_web_identity_sts_endpoint_requires_region_for_cn_partition() {
         let err = resolve_web_identity_sts_endpoint(Some("aws-cn"), None, None)
             .expect_err("aws-cn should require a regional endpoint");
@@ -653,6 +721,15 @@ mod tests {
     fn form_body_percent_encodes() {
         let body = form_body(&[("a+b", "c d"), ("x", "~")]);
         assert_eq!(body, "a%2Bb=c%20d&x=~");
+    }
+
+    #[test]
+    fn sts_mode_and_assume_role_inputs_reject_ambiguous_values() {
+        assert!(StsRegionalEndpointsMode::parse(" regional").is_err());
+        assert!(validate_assume_role_inputs("arn:aws:iam::123:role/demo", "s3-session").is_ok());
+        assert!(validate_assume_role_inputs(" arn:aws:iam::123:role/demo", "s3-session").is_err());
+        assert!(validate_assume_role_inputs("arn:aws:iam::123:role/demo", "x").is_err());
+        assert!(validate_assume_role_inputs("arn:aws:iam::123:role/demo", "bad space").is_err());
     }
 
     #[test]

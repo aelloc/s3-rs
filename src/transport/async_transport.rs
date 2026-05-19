@@ -151,6 +151,7 @@ impl AsyncTransport {
                 self.retry,
                 attempt,
                 max_attempts,
+                &method,
                 resp.status(),
                 resp.headers(),
                 &resp.text_lossy(),
@@ -636,6 +637,42 @@ mod tests {
 
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_exhausts_retryable_status_without_nested_status_retries() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            max_retry_after: Duration::from_secs(30),
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let resp = transport
+            .send(Method::GET, url, HeaderMap::new(), AsyncBody::Empty)
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
     }
 

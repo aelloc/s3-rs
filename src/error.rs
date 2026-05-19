@@ -22,6 +22,8 @@ pub enum Error {
 
     /// Request was throttled by the service.
     RateLimited {
+        /// HTTP status returned by the service.
+        status: StatusCode,
         /// Suggested delay before retrying, usually derived from `Retry-After`.
         retry_after: Option<Duration>,
         /// Service request id, when present in headers or the error payload.
@@ -80,6 +82,7 @@ impl fmt::Debug for Error {
                 f.debug_struct("Signing").field("message", message).finish()
             }
             Self::RateLimited {
+                status,
                 retry_after,
                 request_id,
                 code,
@@ -88,6 +91,7 @@ impl fmt::Debug for Error {
                 body_snippet,
             } => f
                 .debug_struct("RateLimited")
+                .field("status", status)
                 .field("retry_after", retry_after)
                 .field("request_id", request_id)
                 .field("code", code)
@@ -166,7 +170,7 @@ impl Error {
     pub fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Api { status, .. } => Some(*status),
-            Self::RateLimited { .. } => Some(StatusCode::TOO_MANY_REQUESTS),
+            Self::RateLimited { status, .. } => Some(*status),
             Self::InvalidConfig { .. }
             | Self::Signing { .. }
             | Self::Transport { .. }
@@ -264,6 +268,19 @@ fn is_retryable_service_error_code(code: &str) -> bool {
     )
 }
 
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn is_rate_limited_service_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "Throttling"
+            | "ThrottlingException"
+            | "ThrottledException"
+            | "TooManyRequestsException"
+            | "RequestLimitExceeded"
+            | "SlowDown"
+    )
+}
+
 fn format_optional_field(label: &str, value: &Option<String>) -> String {
     match value.as_deref() {
         Some(v) if !v.is_empty() => format!(" {label}={v}"),
@@ -293,6 +310,7 @@ impl fmt::Display for Error {
             Self::InvalidConfig { message } => write!(f, "invalid config: {message}"),
             Self::Signing { message } => write!(f, "signing error: {message}"),
             Self::RateLimited {
+                status,
                 retry_after,
                 code,
                 message,
@@ -307,7 +325,7 @@ impl fmt::Display for Error {
                 let msg = format_optional_message(message);
                 write!(
                     f,
-                    "rate limited{retry_after}{code}{request_id}{host_id}{msg}"
+                    "rate limited: {status}{retry_after}{code}{request_id}{host_id}{msg}"
                 )
             }
             Self::Api {
@@ -315,12 +333,14 @@ impl fmt::Display for Error {
                 code,
                 message,
                 request_id,
+                host_id,
                 ..
             } => {
                 let code = format_optional_field("code", code);
                 let request_id = format_optional_field("request_id", request_id);
+                let host_id = format_optional_field("host_id", host_id);
                 let msg = format_optional_message(message);
-                write!(f, "api error: {status}{code}{request_id}{msg}")
+                write!(f, "api error: {status}{code}{request_id}{host_id}{msg}")
             }
             Self::Transport { message, .. } => write!(f, "transport error: {message}"),
             Self::Decode { message, .. } => write!(f, "decode error: {message}"),
@@ -370,5 +390,21 @@ mod tests {
             body_snippet: None,
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn api_error_display_includes_host_id_when_available() {
+        let err = Error::Api {
+            status: StatusCode::FORBIDDEN,
+            code: Some("AccessDenied".to_string()),
+            message: Some("denied".to_string()),
+            request_id: Some("req-1".to_string()),
+            host_id: Some("host-1".to_string()),
+            body_snippet: None,
+        };
+
+        let text = err.to_string();
+        assert!(text.contains("request_id=req-1"));
+        assert!(text.contains("host_id=host-1"));
     }
 }

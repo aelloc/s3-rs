@@ -20,8 +20,8 @@ use crate::{
     error::{Error, Result},
     transport::async_transport::{AsyncBody, response_error},
     types::{
-        CopyObjectOutput, DeleteObjectIdentifier, DeleteObjectsOutput, GetObjectOutput,
-        HeadObjectOutput, ListObjectsV2Output, PresignedRequest, PutObjectOutput,
+        CopyObjectOutput, DeleteObjectIdentifier, DeleteObjectOutput, DeleteObjectsOutput,
+        GetObjectOutput, HeadObjectOutput, ListObjectsV2Output, PresignedRequest, PutObjectOutput,
     },
 };
 
@@ -756,7 +756,7 @@ pub struct DeleteObjectRequest {
 
 impl DeleteObjectRequest {
     /// Sends the request.
-    pub async fn send(self) -> Result<()> {
+    pub async fn send(self) -> Result<DeleteObjectOutput> {
         let resp = self
             .client
             .execute(
@@ -770,7 +770,7 @@ impl DeleteObjectRequest {
             .await?;
 
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
-            return Ok(());
+            return Ok(DeleteObjectOutput);
         }
 
         Err(response_error(resp).await)
@@ -904,7 +904,7 @@ impl CopyObjectRequest {
             &self.source_bucket,
             &self.source_key,
             self.source_version_id.as_deref(),
-        );
+        )?;
         insert_header(
             &mut headers,
             "x-amz-copy-source",
@@ -1151,7 +1151,7 @@ impl UploadPartCopyRequest {
             &self.source_bucket,
             &self.source_key,
             self.source_version_id.as_deref(),
-        );
+        )?;
         insert_header(
             &mut headers,
             "x-amz-copy-source",

@@ -47,11 +47,15 @@ impl Region {
     /// Creates a region from a non-empty string.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        let value = value.trim();
         if value.is_empty() {
             return Err(Error::invalid_config("region must not be empty"));
         }
-        Ok(Self(value.to_string()))
+        if value.trim() != value {
+            return Err(Error::invalid_config(
+                "region must not include leading or trailing whitespace",
+            ));
+        }
+        Ok(Self(value))
     }
 
     /// Returns the region string.

@@ -77,10 +77,14 @@ fn parse_container_credentials_full_uri(value: &str) -> Result<url::Url, Error> 
 }
 
 fn parse_container_credentials_relative_uri(value: &str) -> Result<String, Error> {
-    let value = value.trim();
     if value.is_empty() {
         return Err(Error::invalid_config(
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must not be empty",
+        ));
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must not include leading or trailing whitespace",
         ));
     }
     if !value.starts_with('/') {
@@ -644,6 +648,16 @@ mod tests {
             Error::InvalidConfig { message } => {
                 assert!(message.contains("must start with '/'"));
             }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_container_credentials_relative_uri_rejects_outer_whitespace() {
+        let err = parse_container_credentials_relative_uri(" /v2/credentials/abc")
+            .expect_err("relative URI whitespace must be rejected");
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("whitespace")),
             other => panic!("expected invalid config, got {other:?}"),
         }
     }

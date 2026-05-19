@@ -225,10 +225,22 @@ pub(crate) fn parse_bucket_public_access_block(
         })?;
 
     Ok(types::BucketPublicAccessBlockConfiguration {
-        block_public_acls: parsed.block_public_acls.unwrap_or(false),
-        ignore_public_acls: parsed.ignore_public_acls.unwrap_or(false),
-        block_public_policy: parsed.block_public_policy.unwrap_or(false),
-        restrict_public_buckets: parsed.restrict_public_buckets.unwrap_or(false),
+        block_public_acls: required_public_access_block_field(
+            parsed.block_public_acls,
+            "BlockPublicAcls",
+        )?,
+        ignore_public_acls: required_public_access_block_field(
+            parsed.ignore_public_acls,
+            "IgnorePublicAcls",
+        )?,
+        block_public_policy: required_public_access_block_field(
+            parsed.block_public_policy,
+            "BlockPublicPolicy",
+        )?,
+        restrict_public_buckets: required_public_access_block_field(
+            parsed.restrict_public_buckets,
+            "RestrictPublicBuckets",
+        )?,
     })
 }
 
@@ -295,9 +307,10 @@ pub(crate) fn parse_upload_part_copy(body: &str) -> Result<types::UploadPartCopy
 }
 
 pub(crate) fn encode_create_bucket_configuration(region: &str) -> Result<Bytes, Error> {
-    let region = non_empty_trimmed(
+    validate_non_empty_trimmed_field(
         region,
         "create bucket location constraint must not be empty",
+        "create bucket location constraint must not include leading or trailing whitespace",
     )?;
 
     #[derive(serde::Serialize)]
@@ -382,6 +395,11 @@ pub(crate) fn encode_delete_objects(
         return Err(Error::invalid_config(
             "delete_objects supports at most 1000 objects per request",
         ));
+    }
+    for object in objects {
+        if let Some(version_id) = object.version_id.as_deref() {
+            crate::util::headers::validate_version_id(version_id)?;
+        }
     }
 
     #[derive(serde::Serialize)]
@@ -755,6 +773,15 @@ fn parse_encryption_rule(
     })
 }
 
+fn required_public_access_block_field(value: Option<bool>, field: &str) -> Result<bool, Error> {
+    value.ok_or_else(|| {
+        Error::decode(
+            format!("missing {field} in PublicAccessBlockConfiguration"),
+            None,
+        )
+    })
+}
+
 fn validate_bucket_lifecycle(
     configuration: &types::BucketLifecycleConfiguration,
 ) -> Result<(), Error> {
@@ -823,6 +850,15 @@ fn validate_bucket_cors(configuration: &types::BucketCorsConfiguration) -> Resul
             ));
         }
         if rule
+            .allowed_origins
+            .iter()
+            .any(|value| value.trim() != value)
+        {
+            return Err(Error::invalid_config(
+                "bucket cors allowed origins must not include leading or trailing whitespace",
+            ));
+        }
+        if rule
             .allowed_headers
             .iter()
             .any(|value| value.trim().is_empty())
@@ -836,12 +872,40 @@ fn validate_bucket_cors(configuration: &types::BucketCorsConfiguration) -> Resul
             ));
         }
         if rule
+            .allowed_headers
+            .iter()
+            .chain(rule.expose_headers.iter())
+            .any(|value| value.trim() != value)
+        {
+            return Err(Error::invalid_config(
+                "bucket cors header names must not include leading or trailing whitespace",
+            ));
+        }
+        if rule
             .allowed_methods
             .iter()
             .any(|method| method.as_str().trim().is_empty())
         {
             return Err(Error::invalid_config(
                 "bucket cors allowed methods must not be empty",
+            ));
+        }
+        if rule
+            .allowed_methods
+            .iter()
+            .any(|method| method.as_str().trim() != method.as_str())
+        {
+            return Err(Error::invalid_config(
+                "bucket cors allowed methods must not include leading or trailing whitespace",
+            ));
+        }
+        if rule
+            .allowed_methods
+            .iter()
+            .any(|method| http::Method::from_bytes(method.as_str().as_bytes()).is_err())
+        {
+            return Err(Error::invalid_config(
+                "bucket cors allowed methods must be valid HTTP method tokens",
             ));
         }
     }
@@ -885,6 +949,20 @@ fn validate_bucket_encryption(
     }
 
     for rule in &configuration.rules {
+        if let types::SseAlgorithm::Other(value) = &rule.apply.sse_algorithm {
+            validate_non_empty_trimmed_field(
+                value,
+                "bucket encryption SSE algorithm must not be empty",
+                "bucket encryption SSE algorithm must not include leading or trailing whitespace",
+            )?;
+        }
+        if let Some(kms_master_key_id) = &rule.apply.kms_master_key_id {
+            validate_non_empty_trimmed_field(
+                kms_master_key_id,
+                "bucket encryption KMS master key id must not be empty",
+                "bucket encryption KMS master key id must not include leading or trailing whitespace",
+            )?;
+        }
         if matches!(rule.apply.sse_algorithm, types::SseAlgorithm::Aes256)
             && rule.apply.kms_master_key_id.is_some()
         {
@@ -897,12 +975,18 @@ fn validate_bucket_encryption(
     Ok(())
 }
 
-fn non_empty_trimmed<'a>(value: &'a str, message: &'static str) -> Result<&'a str, Error> {
-    let value = value.trim();
+fn validate_non_empty_trimmed_field(
+    value: &str,
+    empty_message: &'static str,
+    whitespace_message: &'static str,
+) -> Result<(), Error> {
     if value.is_empty() {
-        return Err(Error::invalid_config(message));
+        return Err(Error::invalid_config(empty_message));
     }
-    Ok(value)
+    if value.trim() != value {
+        return Err(Error::invalid_config(whitespace_message));
+    }
+    Ok(())
 }
 
 fn parse_versioning_status(value: &str) -> Result<types::BucketVersioningStatus, Error> {
@@ -1262,6 +1346,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_bucket_public_access_block_rejects_missing_fields() {
+        let xml = r#"
+<PublicAccessBlockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <BlockPublicAcls>true</BlockPublicAcls>
+  <BlockPublicPolicy>true</BlockPublicPolicy>
+  <RestrictPublicBuckets>false</RestrictPublicBuckets>
+</PublicAccessBlockConfiguration>
+"#;
+
+        assert_decode_error(parse_bucket_public_access_block(xml), "IgnorePublicAcls");
+    }
+
+    #[test]
     fn parses_delete_objects() {
         let xml = r#"
 <DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1333,6 +1430,13 @@ mod tests {
     }
 
     #[test]
+    fn encode_delete_objects_rejects_invalid_version_id() {
+        let objects = [DeleteObjectIdentifier::new("key").with_version_id(" version")];
+
+        assert_invalid_config(encode_delete_objects(&objects, false), "version_id");
+    }
+
+    #[test]
     fn encodes_bucket_versioning() {
         let cfg = types::BucketVersioningConfiguration {
             status: Some(types::BucketVersioningStatus::Enabled),
@@ -1348,11 +1452,16 @@ mod tests {
 
     #[test]
     fn encodes_create_bucket_configuration() {
-        let xml = encode_create_bucket_configuration(" eu-central-1 ").unwrap();
+        let xml = encode_create_bucket_configuration("eu-central-1").unwrap();
         let xml = String::from_utf8_lossy(&xml).to_string();
         assert!(xml.contains("<CreateBucketConfiguration"));
         assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
         assert!(xml.contains("<LocationConstraint>eu-central-1</LocationConstraint>"));
+
+        assert_invalid_config(
+            encode_create_bucket_configuration(" eu-central-1"),
+            "whitespace",
+        );
     }
 
     #[test]
@@ -1453,6 +1562,34 @@ mod tests {
     }
 
     #[test]
+    fn encode_bucket_cors_rejects_malformed_values() {
+        let mut rule = types::BucketCorsRule {
+            id: None,
+            allowed_origins: vec![" https://example.com".to_string()],
+            allowed_methods: vec![types::CorsMethod::Get],
+            allowed_headers: Vec::new(),
+            expose_headers: Vec::new(),
+            max_age_seconds: None,
+        };
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "allowed origins");
+
+        rule.allowed_origins = vec!["https://example.com".to_string()];
+        rule.allowed_headers = vec![" X-Test".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "header names");
+
+        rule.allowed_headers.clear();
+        rule.allowed_methods = vec![types::CorsMethod::Other(" GET".to_string())];
+        let cfg = types::BucketCorsConfiguration { rules: vec![rule] };
+        assert_invalid_config(encode_bucket_cors(&cfg), "allowed methods");
+    }
+
+    #[test]
     fn encodes_bucket_tagging() {
         let cfg = types::BucketTagging {
             tags: vec![types::Tag {
@@ -1520,6 +1657,31 @@ mod tests {
         };
 
         assert_invalid_config(encode_bucket_encryption(&cfg), "AWS KMS algorithm");
+    }
+
+    #[test]
+    fn encode_bucket_encryption_rejects_malformed_values() {
+        let cfg = types::BucketEncryptionConfiguration {
+            rules: vec![types::BucketEncryptionRule {
+                apply: types::ApplyServerSideEncryptionByDefault {
+                    sse_algorithm: types::SseAlgorithm::Other(" ".to_string()),
+                    kms_master_key_id: None,
+                },
+                bucket_key_enabled: None,
+            }],
+        };
+        assert_invalid_config(encode_bucket_encryption(&cfg), "SSE algorithm");
+
+        let cfg = types::BucketEncryptionConfiguration {
+            rules: vec![types::BucketEncryptionRule {
+                apply: types::ApplyServerSideEncryptionByDefault {
+                    sse_algorithm: types::SseAlgorithm::AwsKms,
+                    kms_master_key_id: Some(" ".to_string()),
+                },
+                bucket_key_enabled: Some(true),
+            }],
+        };
+        assert_invalid_config(encode_bucket_encryption(&cfg), "KMS master key id");
     }
 
     #[test]

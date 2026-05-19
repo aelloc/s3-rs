@@ -22,8 +22,8 @@ use crate::{
     transport::blocking_transport::{BlockingBody, response_error},
     types::{
         BlockingByteStream, BlockingGetObjectOutput, CopyObjectOutput, DeleteObjectIdentifier,
-        DeleteObjectsOutput, HeadObjectOutput, ListObjectsV2Output, PresignedRequest,
-        PutObjectOutput,
+        DeleteObjectOutput, DeleteObjectsOutput, HeadObjectOutput, ListObjectsV2Output,
+        PresignedRequest, PutObjectOutput,
     },
 };
 
@@ -753,7 +753,7 @@ pub struct BlockingDeleteObjectRequest {
 
 impl BlockingDeleteObjectRequest {
     /// Sends the request.
-    pub fn send(self) -> Result<()> {
+    pub fn send(self) -> Result<DeleteObjectOutput> {
         let resp = self.client.execute(
             Method::DELETE,
             Some(&self.bucket),
@@ -765,7 +765,7 @@ impl BlockingDeleteObjectRequest {
 
         let status = resp.status();
         if status == StatusCode::NO_CONTENT || status.is_success() {
-            return Ok(());
+            return Ok(DeleteObjectOutput);
         }
 
         let (parts, body) = resp.into_parts();
@@ -898,7 +898,7 @@ impl BlockingCopyObjectRequest {
             &self.source_bucket,
             &self.source_key,
             self.source_version_id.as_deref(),
-        );
+        )?;
         insert_header(
             &mut headers,
             "x-amz-copy-source",
@@ -1134,7 +1134,7 @@ impl BlockingUploadPartCopyRequest {
             &self.source_bucket,
             &self.source_key,
             self.source_version_id.as_deref(),
-        );
+        )?;
         insert_header(
             &mut headers,
             "x-amz-copy-source",

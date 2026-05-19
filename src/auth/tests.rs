@@ -24,8 +24,9 @@ use super::*;
 fn region_validates_non_empty() {
     assert!(Region::new("").is_err());
     assert!(Region::new("   ").is_err());
+    assert!(Region::new(" us-east-1").is_err());
+    assert!(Region::new("us-east-1 ").is_err());
     assert!(Region::new("us-east-1").is_ok());
-    assert_eq!(Region::new(" us-east-1 ").unwrap().as_str(), "us-east-1");
 }
 
 #[test]

@@ -155,9 +155,14 @@ pub(crate) fn prepare_completed_parts(mut parts: Vec<CompletedPart>) -> Result<V
 
     for part in &parts {
         validate_upload_part_number(part.part_number)?;
-        if part.etag.trim().is_empty() {
+        if part.etag.is_empty() {
             return Err(Error::invalid_config(
                 "completed part etag must not be empty",
+            ));
+        }
+        if part.etag.trim() != part.etag {
+            return Err(Error::invalid_config(
+                "completed part etag must not include leading or trailing whitespace",
             ));
         }
     }
@@ -176,8 +181,13 @@ pub(crate) fn prepare_completed_parts(mut parts: Vec<CompletedPart>) -> Result<V
 }
 
 pub(crate) fn validate_subresource(subresource: &str) -> Result<()> {
-    if subresource.trim().is_empty() {
+    if subresource.is_empty() {
         return Err(Error::invalid_config("subresource must not be empty"));
+    }
+    if subresource.trim() != subresource {
+        return Err(Error::invalid_config(
+            "subresource must not include leading or trailing whitespace",
+        ));
     }
     Ok(())
 }
@@ -295,6 +305,13 @@ mod tests {
             .is_err()
         );
         assert!(
+            prepare_completed_parts(vec![CompletedPart {
+                part_number: 1,
+                etag: " etag".to_string(),
+            }])
+            .is_err()
+        );
+        assert!(
             prepare_completed_parts(vec![
                 CompletedPart {
                     part_number: 1,
@@ -323,6 +340,8 @@ mod tests {
         assert!(validate_subresource("versioning").is_ok());
         assert!(validate_subresource("").is_err());
         assert!(validate_subresource("   ").is_err());
+        assert!(validate_subresource(" versioning").is_err());
+        assert!(validate_subresource("versioning ").is_err());
     }
 
     #[test]

@@ -31,9 +31,13 @@ pub(crate) fn redact_value(value: &str) -> String {
 
 #[cfg(any(test, feature = "async", feature = "blocking"))]
 pub(crate) fn metadata_header_name(value: &str) -> Result<HeaderName, Error> {
-    let value = value.trim();
     if value.is_empty() {
         return Err(Error::invalid_config("metadata key must not be empty"));
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(
+            "metadata key must not include leading or trailing whitespace",
+        ));
     }
 
     let mut name = String::with_capacity("x-amz-meta-".len() + value.len());
@@ -60,10 +64,11 @@ mod tests {
 
     #[test]
     fn builds_metadata_header_name() {
-        let name = metadata_header_name(" Foo ").unwrap();
+        let name = metadata_header_name("Foo").unwrap();
         assert_eq!(name.as_str(), "x-amz-meta-foo");
 
         assert!(metadata_header_name("").is_err());
+        assert!(metadata_header_name(" Foo ").is_err());
         assert!(metadata_header_name("a b").is_err());
     }
 }

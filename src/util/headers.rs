@@ -1,5 +1,7 @@
 use http::{HeaderMap, header::AsHeaderName};
 
+use crate::{Error, Result};
+
 pub(crate) fn header_string<N>(headers: &HeaderMap, name: N) -> Option<String>
 where
     N: AsHeaderName,
@@ -24,17 +26,32 @@ pub(crate) fn copy_source_header_value(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
-) -> String {
+) -> Result<String> {
     let bucket_enc = crate::util::encode::aws_percent_encode(bucket);
     let key_enc = crate::util::encode::aws_percent_encode_path(key);
 
-    match version_id {
+    let value = match version_id {
         Some(v) => {
+            validate_version_id(v)?;
             let version_enc = crate::util::encode::aws_percent_encode(v);
             format!("/{bucket_enc}/{key_enc}?versionId={version_enc}")
         }
         None => format!("/{bucket_enc}/{key_enc}"),
+    };
+
+    Ok(value)
+}
+
+pub(crate) fn validate_version_id(version_id: &str) -> Result<()> {
+    if version_id.is_empty() {
+        return Err(Error::invalid_config("version_id must not be empty"));
     }
+    if version_id.trim() != version_id {
+        return Err(Error::invalid_config(
+            "version_id must not include leading or trailing whitespace",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -54,8 +71,15 @@ mod tests {
     #[test]
     fn copy_source_header_value_encodes_bucket_key_and_version() {
         assert_eq!(
-            copy_source_header_value("bucket name", "dir/file name.txt", Some("v 1")),
+            copy_source_header_value("bucket name", "dir/file name.txt", Some("v 1")).unwrap(),
             "/bucket%20name/dir/file%20name.txt?versionId=v%201"
         );
+    }
+
+    #[test]
+    fn copy_source_header_value_rejects_invalid_version_id() {
+        assert!(copy_source_header_value("bucket", "key", Some("")).is_err());
+        assert!(copy_source_header_value("bucket", "key", Some(" version")).is_err());
+        assert!(copy_source_header_value("bucket", "key", Some("version ")).is_err());
     }
 }
