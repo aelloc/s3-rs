@@ -182,10 +182,13 @@ jobs:
         run: |
           docker run -d --name rustfs \
             -p 9000:9000 -p 9001:9001 \
+            -v rustfs-data:/data \
+            -e RUSTFS_ADDRESS=:9000 \
             -e RUSTFS_ACCESS_KEY=rustfsadmin \
             -e RUSTFS_SECRET_KEY=rustfsadmin \
-            -e RUSTFS_SERVER_DOMAINS=localhost:9000 \
-            rustfs/rustfs:latest
+            -e RUSTFS_SERVER_DOMAINS=localhost \
+            rustfs/rustfs:latest \
+            /data
       - name: Wait for RustFS
         run: |
           for i in $(seq 1 60); do
@@ -195,6 +198,8 @@ jobs:
             sleep 1
           done
           echo "RustFS did not become ready in time" >&2
+          docker ps -a --filter name=rustfs >&2 || true
+          docker logs rustfs >&2 || true
           exit 1
       - name: Async integration
         run: cargo test --test s3_compat_async --features multipart
@@ -206,4 +211,6 @@ jobs:
         run: cargo test --test s3_compat_blocking --no-default-features --features blocking,native-tls,multipart
       - name: Stop RustFS
         if: always()
-        run: docker rm -f rustfs || true
+        run: |
+          docker rm -f rustfs || true
+          docker volume rm rustfs-data || true
