@@ -10,7 +10,7 @@ pub(crate) fn optional_var(name: &'static str) -> Result<Option<String>> {
     }
 }
 
-#[cfg(any(test, feature = "credentials-profile"))]
+#[cfg(feature = "credentials-profile")]
 pub(crate) fn optional_first_var(names: &[&'static str]) -> Result<Option<(&'static str, String)>> {
     optional_first_var_with(names, optional_var)
 }
