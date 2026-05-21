@@ -298,7 +298,7 @@ impl ClientBuilder {
 
     /// Sets the maximum number of retry attempts.
     pub fn max_attempts(mut self, max_attempts: u32) -> Self {
-        self.retry.max_attempts = max_attempts.max(1);
+        self.retry.max_attempts = max_attempts;
         self
     }
 
@@ -420,6 +420,24 @@ mod tests {
             Error::InvalidConfig { message } => {
                 assert!(message.contains("must not include user info"));
             }
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_rejects_zero_max_attempts() {
+        let err = match Client::builder("https://s3.example.com")
+            .expect("builder should parse")
+            .region("us-east-1")
+            .max_attempts(0)
+            .build()
+        {
+            Ok(_) => panic!("zero retry attempts must be rejected"),
+            Err(err) => err,
+        };
+
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("max_attempts")),
             other => panic!("expected invalid config, got {other:?}"),
         }
     }

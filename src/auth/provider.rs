@@ -9,7 +9,7 @@ use std::{future::Future, pin::Pin};
 ))]
 use reqx::advanced::TlsRootStore;
 
-use crate::{Error, Result};
+use crate::Result;
 
 use super::{Auth, Credentials};
 
@@ -193,11 +193,9 @@ impl Auth {
     ///
     /// Reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`.
     pub fn from_env() -> Result<Self> {
-        let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-            .map_err(|_| Error::invalid_config("missing AWS_ACCESS_KEY_ID"))?;
-        let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-            .map_err(|_| Error::invalid_config("missing AWS_SECRET_ACCESS_KEY"))?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        let access_key_id = crate::util::env::required_var("AWS_ACCESS_KEY_ID")?;
+        let secret_access_key = crate::util::env::required_var("AWS_SECRET_ACCESS_KEY")?;
+        let session_token = crate::util::env::optional_var("AWS_SESSION_TOKEN")?;
 
         let mut creds = Credentials::new(access_key_id, secret_access_key)?;
         if let Some(token) = session_token {
@@ -222,7 +220,7 @@ impl Auth {
     /// Loads credentials from the profile defined by environment variables.
     #[cfg(feature = "credentials-profile")]
     pub fn from_profile_env() -> Result<Self> {
-        Self::from_profile(crate::credentials::profile::profile_from_env())
+        Self::from_profile(crate::credentials::profile::profile_from_env()?)
     }
 
     /// Loads IMDS credentials and wraps them in a cached provider.

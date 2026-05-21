@@ -133,16 +133,9 @@ pub(crate) fn presign(
     headers: &HeaderMap,
 ) -> Result<PresignedRequest, Error> {
     let mut resolved = resolved;
-    let expires = expires_in.as_secs();
-    if expires == 0 {
-        return Err(Error::invalid_config("presign expires_in must be > 0"));
-    }
-    if expires > 604_800 {
-        return Err(Error::invalid_config(
-            "presign expires_in must be <= 7 days",
-        ));
-    }
+    let expires = validate_presign_expires(expires_in)?;
     validate_existing_presign_query_params(existing_query_params)?;
+    validate_presign_headers(headers)?;
 
     let mut signing_headers = headers.clone();
     signing_headers.insert(http::header::HOST, host_header_value(&resolved.url)?);
@@ -206,31 +199,92 @@ pub(crate) fn presign(
     })
 }
 
+fn validate_presign_expires(expires_in: std::time::Duration) -> Result<u64, Error> {
+    const MAX_PRESIGN_EXPIRES: std::time::Duration = std::time::Duration::from_secs(604_800);
+
+    if expires_in.is_zero() {
+        return Err(Error::invalid_config("presign expires_in must be > 0"));
+    }
+    if expires_in.subsec_nanos() != 0 {
+        return Err(Error::invalid_config(
+            "presign expires_in must use whole seconds",
+        ));
+    }
+    if expires_in > MAX_PRESIGN_EXPIRES {
+        return Err(Error::invalid_config(
+            "presign expires_in must be <= 7 days",
+        ));
+    }
+
+    Ok(expires_in.as_secs())
+}
+
 fn validate_existing_presign_query_params(
     existing_query_params: &[(String, String)],
 ) -> Result<(), Error> {
-    for (name, _) in existing_query_params {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            return Err(Error::invalid_config(
-                "presign query parameter name must not be empty",
-            ));
-        }
-        if trimmed != name {
-            return Err(Error::invalid_config(
-                "presign query parameter name must not include leading or trailing whitespace",
-            ));
-        }
-        if trimmed
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-amz-"))
-        {
-            return Err(Error::invalid_config(
-                "presign query parameters must not use reserved x-amz-* names",
-            ));
+    for (name, value) in existing_query_params {
+        validate_presign_query_name(name)?;
+        validate_presign_query_value(value)?;
+    }
+    Ok(())
+}
+
+fn validate_presign_query_name(name: &str) -> Result<(), Error> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(Error::invalid_config(
+            "presign query parameter name must not be empty",
+        ));
+    }
+    if trimmed != name {
+        return Err(Error::invalid_config(
+            "presign query parameter name must not include leading or trailing whitespace",
+        ));
+    }
+    if name
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "presign query parameter name must not contain ASCII control or whitespace characters",
+        ));
+    }
+    if trimmed
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-amz-"))
+    {
+        return Err(Error::invalid_config(
+            "presign query parameters must not use reserved x-amz-* names",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_presign_query_value(value: &str) -> Result<(), Error> {
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::invalid_config(
+            "presign query parameter value must not contain ASCII control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_presign_headers(headers: &HeaderMap) -> Result<(), Error> {
+    for name in headers.keys() {
+        if is_sigv4_managed_presign_header(name.as_str()) {
+            return Err(Error::invalid_config(format!(
+                "presign headers must not include SigV4-managed header {name}"
+            )));
         }
     }
     Ok(())
+}
+
+fn is_sigv4_managed_presign_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host" | "authorization" | "x-amz-content-sha256" | "x-amz-date" | "x-amz-security-token"
+    )
 }
 
 fn set_amz_headers(
@@ -647,6 +701,20 @@ mod tests {
     }
 
     #[test]
+    fn presign_rejects_ambiguous_expiration_durations() {
+        assert!(validate_presign_expires(Duration::ZERO).is_err());
+        assert!(validate_presign_expires(Duration::from_millis(1500)).is_err());
+        assert!(
+            validate_presign_expires(Duration::from_secs(604_800) + Duration::from_nanos(1))
+                .is_err()
+        );
+        assert_eq!(
+            validate_presign_expires(Duration::from_secs(604_800)).unwrap(),
+            604_800
+        );
+    }
+
+    #[test]
     fn presign_rejects_reserved_amz_query_params() {
         let endpoint = url::Url::parse("https://example.com").unwrap();
         let region = Region::new("us-east-1").unwrap();
@@ -714,6 +782,125 @@ mod tests {
                 assert!(message.contains("whitespace"));
             }
             other => panic!("expected invalid config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_rejects_query_param_names_with_internal_whitespace() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Path,
+        )
+        .unwrap();
+
+        let err = presign(
+            Method::GET,
+            resolved,
+            SigV4Params::for_s3(&region, &creds, now),
+            Duration::from_secs(60),
+            &[(
+                "response content type".to_string(),
+                "text/plain".to_string(),
+            )],
+            &HeaderMap::new(),
+        )
+        .expect_err("query names with internal whitespace must be rejected");
+
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("whitespace"));
+            }
+            other => panic!("expected invalid config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_rejects_query_param_values_with_control_characters() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Path,
+        )
+        .unwrap();
+
+        let err = presign(
+            Method::GET,
+            resolved,
+            SigV4Params::for_s3(&region, &creds, now),
+            Duration::from_secs(60),
+            &[(
+                "response-content-disposition".to_string(),
+                "attachment\nfilename=report.csv".to_string(),
+            )],
+            &HeaderMap::new(),
+        )
+        .expect_err("query values with control characters must be rejected");
+
+        match err {
+            Error::InvalidConfig { message } => {
+                assert!(message.contains("control"));
+            }
+            other => panic!("expected invalid config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_rejects_sigv4_managed_headers() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+
+        for header in [
+            http::header::HOST,
+            http::header::AUTHORIZATION,
+            http::header::HeaderName::from_static("x-amz-date"),
+            http::header::HeaderName::from_static("x-amz-content-sha256"),
+            http::header::HeaderName::from_static("x-amz-security-token"),
+        ] {
+            let resolved = s3_url::resolve_url(
+                &endpoint,
+                Some("my-bucket"),
+                Some("a+b"),
+                &[],
+                AddressingStyle::Path,
+            )
+            .unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_static("managed"));
+
+            let err = presign(
+                Method::GET,
+                resolved,
+                SigV4Params::for_s3(&region, &creds, now),
+                Duration::from_secs(60),
+                &[],
+                &headers,
+            )
+            .expect_err("SigV4-managed headers must be rejected");
+
+            match err {
+                Error::InvalidConfig { message } => {
+                    assert!(message.contains("SigV4-managed"));
+                }
+                other => panic!("expected invalid config error, got {other:?}"),
+            }
         }
     }
 }

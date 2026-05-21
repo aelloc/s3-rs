@@ -31,14 +31,7 @@ impl AwsRegion {
     /// Creates a custom region variant.
     pub fn other(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        if value.is_empty() {
-            return Err(Error::invalid_config("region must not be empty"));
-        }
-        if value.trim() != value {
-            return Err(Error::invalid_config(
-                "region must not include leading or trailing whitespace",
-            ));
-        }
+        validate_region_id(&value)?;
         Ok(Self::Other(value))
     }
 
@@ -58,14 +51,7 @@ impl std::str::FromStr for AwsRegion {
     type Err = Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        if value.is_empty() {
-            return Err(Error::invalid_config("region must not be empty"));
-        }
-        if value.trim() != value {
-            return Err(Error::invalid_config(
-                "region must not include leading or trailing whitespace",
-            ));
-        }
+        validate_region_id(value)?;
         Ok(match value {
             "us-east-1" => Self::UsEast1,
             "us-west-2" => Self::UsWest2,
@@ -185,14 +171,7 @@ impl Preset {
 /// Builds a preset for AWS S3.
 pub fn aws_s3(region: impl AsRef<str>) -> Result<Preset> {
     let region = region.as_ref();
-    if region.is_empty() {
-        return Err(Error::invalid_config("region must not be empty"));
-    }
-    if region.trim() != region {
-        return Err(Error::invalid_config(
-            "region must not include leading or trailing whitespace",
-        ));
-    }
+    validate_region_id(region)?;
 
     let suffix = if region.starts_with("cn-") {
         "amazonaws.com.cn"
@@ -235,7 +214,8 @@ pub fn cloudflare_r2(account_id: impl AsRef<str>, endpoint: R2Endpoint) -> Resul
         ));
     }
 
-    let invalid = account_id.starts_with('-')
+    let invalid = account_id.len() > 63
+        || account_id.starts_with('-')
         || account_id.ends_with('-')
         || !account_id
             .chars()
@@ -258,6 +238,26 @@ pub fn cloudflare_r2(account_id: impl AsRef<str>, endpoint: R2Endpoint) -> Resul
         region: "auto".to_string(),
         addressing_style: AddressingStyle::Path,
     })
+}
+
+fn validate_region_id(region: &str) -> Result<()> {
+    if region.is_empty() {
+        return Err(Error::invalid_config("AWS region must not be empty"));
+    }
+    if region.trim() != region {
+        return Err(Error::invalid_config(
+            "AWS region must not include leading or trailing whitespace",
+        ));
+    }
+    if !region
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(Error::invalid_config(
+            "AWS region must contain only lowercase ASCII letters, digits, or '-'",
+        ));
+    }
+    Ok(())
 }
 
 /// Local MinIO preset for development.
@@ -344,7 +344,12 @@ mod tests {
             AwsRegion::Other("unknown-1".to_string())
         );
         assert!(AwsRegion::other(" custom-1 ").is_err());
+        assert!(AwsRegion::other("custom 1").is_err());
+        assert!(AwsRegion::other("custom/1").is_err());
+        assert!(AwsRegion::other("US-EAST-1").is_err());
+        assert!(AwsRegion::other("us_east_1").is_err());
         assert!(" custom-1 ".parse::<AwsRegion>().is_err());
+        assert!("custom\n1".parse::<AwsRegion>().is_err());
     }
 
     #[test]
@@ -356,7 +361,10 @@ mod tests {
     #[test]
     fn presets_reject_outer_whitespace() {
         assert!(aws_s3(" us-east-1").is_err());
+        assert!(aws_s3("us east 1").is_err());
+        assert!(aws_s3("us/east/1").is_err());
         assert!(cloudflare_r2(" 123", R2Endpoint::Global).is_err());
+        assert!(cloudflare_r2("a".repeat(64), R2Endpoint::Global).is_err());
         assert!(" eu".parse::<R2Jurisdiction>().is_err());
     }
 }

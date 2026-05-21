@@ -39,6 +39,9 @@ pub(crate) fn resolve_url(
         });
     };
     validate_bucket_name(bucket)?;
+    if let Some(key) = key {
+        validate_object_key(key)?;
+    }
 
     let host = base_url
         .host_str()
@@ -66,7 +69,7 @@ pub(crate) fn resolve_url(
                 ));
             }
             let raw_path = match key {
-                Some(key) if !key.is_empty() => format!("/{key}"),
+                Some(key) => format!("/{key}"),
                 _ => "/".to_string(),
             };
             (Some(format!("{bucket}.{host}")), raw_path)
@@ -141,6 +144,31 @@ fn validate_bucket_name(bucket: &str) -> Result<(), Error> {
     }
     if bucket.contains('/') {
         return Err(Error::invalid_config("bucket must not contain '/'"));
+    }
+    if bucket
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "bucket must not contain ASCII control or whitespace characters",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_object_key(key: &str) -> Result<(), Error> {
+    if key.is_empty() {
+        return Err(Error::invalid_config("object key must not be empty"));
+    }
+    if key.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::invalid_config(
+            "object key must not contain ASCII control characters",
+        ));
+    }
+    if key.split('/').any(|segment| matches!(segment, "." | "..")) {
+        return Err(Error::invalid_config(
+            "object key must not contain '.' or '..' path segments",
+        ));
     }
     Ok(())
 }
@@ -356,11 +384,64 @@ mod tests {
     }
 
     #[test]
+    fn empty_object_key_is_rejected() {
+        let base = Url::parse("https://example.com").unwrap();
+        let err = match resolve_url(
+            &base,
+            Some("my-bucket"),
+            Some(""),
+            &[],
+            AddressingStyle::Path,
+        ) {
+            Ok(_) => panic!("empty object key should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_invalid_config_contains(err, "object key");
+    }
+
+    #[test]
+    fn object_key_dot_segments_are_rejected() {
+        let base = Url::parse("https://example.com").unwrap();
+        for key in [".", "..", "a/./b", "a/../b"] {
+            let err = resolve_url(
+                &base,
+                Some("my-bucket"),
+                Some(key),
+                &[],
+                AddressingStyle::Path,
+            )
+            .expect_err("period-only key segments must be rejected");
+
+            assert_invalid_config_contains(err, "path segments");
+        }
+    }
+
+    #[test]
+    fn object_key_control_characters_are_rejected() {
+        let base = Url::parse("https://example.com").unwrap();
+        for key in ["line\nbreak", "bad\u{7f}"] {
+            let err = resolve_url(
+                &base,
+                Some("my-bucket"),
+                Some(key),
+                &[],
+                AddressingStyle::Path,
+            )
+            .expect_err("control-character key should be rejected");
+
+            assert_invalid_config_contains(err, "control");
+        }
+    }
+
+    #[test]
     fn malformed_bucket_names_are_rejected() {
         let base = Url::parse("https://example.com").unwrap();
         let cases = [
             (" bucket", "whitespace"),
             ("bucket ", "whitespace"),
+            ("buck et", "whitespace"),
+            ("buck\tet", "whitespace"),
             ("a/b", "'/'"),
         ];
 

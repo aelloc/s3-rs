@@ -44,7 +44,7 @@ impl CredentialsSnapshot {
 pub struct Region(String);
 
 impl Region {
-    /// Creates a region from a non-empty string.
+    /// Creates a region from a non-empty lowercase DNS-compatible string.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if value.is_empty() {
@@ -53,6 +53,14 @@ impl Region {
         if value.trim() != value {
             return Err(Error::invalid_config(
                 "region must not include leading or trailing whitespace",
+            ));
+        }
+        if !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(Error::invalid_config(
+                "region must contain only lowercase ASCII letters, digits, or '-'",
             ));
         }
         Ok(Self(value))
@@ -130,6 +138,19 @@ fn validate_credential_field(name: &'static str, value: &str) -> Result<()> {
     if value.trim() != value {
         return Err(Error::invalid_config(format!(
             "{name} must not include leading or trailing whitespace"
+        )));
+    }
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(format!(
+            "{name} must not contain ASCII control or whitespace characters"
+        )));
+    }
+    if !value.is_ascii() {
+        return Err(Error::invalid_config(format!(
+            "{name} must contain only ASCII characters"
         )));
     }
     Ok(())

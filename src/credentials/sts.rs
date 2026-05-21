@@ -57,12 +57,9 @@ pub(crate) async fn assume_role_async(
     )?;
 
     let client = sts_async_client(Duration::from_secs(10), tls_root_store)?;
-    let (status, headers, text) =
+    let (status, headers, body) =
         send_form_async(&client, resolved.url.as_str(), headers, body_bytes).await?;
-
-    if !status.is_success() {
-        return Err(sts_api_error(status, &headers, &text));
-    }
+    let text = sts_response_text(status, &headers, &body)?;
 
     parse_assume_role_response(&text)
 }
@@ -109,12 +106,9 @@ pub(crate) fn assume_role_blocking(
     )?;
 
     let client = sts_blocking_client(Duration::from_secs(10), tls_root_store)?;
-    let (status, headers, text) =
+    let (status, headers, body) =
         send_form_blocking(&client, resolved.url.as_str(), headers, body_bytes)?;
-
-    if !status.is_success() {
-        return Err(sts_api_error(status, &headers, &text));
-    }
+    let text = sts_response_text(status, &headers, &body)?;
 
     parse_assume_role_response(&text)
 }
@@ -144,12 +138,9 @@ pub(crate) async fn assume_role_with_web_identity_env_async(
     );
 
     let client = sts_async_client(Duration::from_secs(10), tls_root_store)?;
-    let (status, headers, text) =
+    let (status, headers, body) =
         send_form_async(&client, endpoint.as_str(), headers, body_bytes).await?;
-
-    if !status.is_success() {
-        return Err(sts_api_error(status, &headers, &text));
-    }
+    let text = sts_response_text(status, &headers, &body)?;
 
     parse_assume_role_with_web_identity_response(&text)
 }
@@ -178,12 +169,9 @@ pub(crate) fn assume_role_with_web_identity_env_blocking(
     );
 
     let client = sts_blocking_client(Duration::from_secs(10), tls_root_store)?;
-    let (status, headers, text) =
+    let (status, headers, body) =
         send_form_blocking(&client, endpoint.as_str(), headers, Bytes::from(body))?;
-
-    if !status.is_success() {
-        return Err(sts_api_error(status, &headers, &text));
-    }
+    let text = sts_response_text(status, &headers, &body)?;
 
     parse_assume_role_with_web_identity_response(&text)
 }
@@ -194,7 +182,7 @@ async fn send_form_async(
     url: &str,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, HeaderMap, String), Error> {
+) -> Result<(StatusCode, HeaderMap, Bytes), Error> {
     let mut req = client
         .request(Method::POST, url.to_string())
         .body(body)
@@ -211,11 +199,7 @@ async fn send_form_async(
         .send()
         .await
         .map_err(|e| crate::transport::map_reqx_error("request failed", e))?;
-    Ok((
-        resp.status(),
-        resp.headers().clone(),
-        String::from_utf8_lossy(resp.body()).to_string(),
-    ))
+    Ok((resp.status(), resp.headers().clone(), resp.body().clone()))
 }
 
 #[cfg(feature = "blocking")]
@@ -224,7 +208,7 @@ fn send_form_blocking(
     url: &str,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<(StatusCode, HeaderMap, String), Error> {
+) -> Result<(StatusCode, HeaderMap, Bytes), Error> {
     let mut req = client
         .request(Method::POST, url.to_string())
         .body(body)
@@ -240,11 +224,20 @@ fn send_form_blocking(
         .status_policy(StatusPolicy::Response)
         .send()
         .map_err(|e| crate::transport::map_reqx_error("request failed", e))?;
-    Ok((
-        resp.status(),
-        resp.headers().clone(),
-        String::from_utf8_lossy(resp.body()).to_string(),
-    ))
+    Ok((resp.status(), resp.headers().clone(), resp.body().clone()))
+}
+
+fn sts_response_text(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<String, Error> {
+    if status.is_success() {
+        return crate::util::text::decode_utf8_response_body(body);
+    }
+
+    let text = crate::util::text::decode_utf8_response_body(body)?;
+    Err(sts_api_error(status, headers, &text))
 }
 
 fn sts_regional_endpoint(region: &Region) -> Result<url::Url, Error> {
@@ -288,26 +281,19 @@ impl StsRegionalEndpointsMode {
 }
 
 fn sts_regional_endpoints_mode_from_env() -> Result<Option<StsRegionalEndpointsMode>, Error> {
-    let value = match std::env::var("AWS_STS_REGIONAL_ENDPOINTS") {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    if value.is_empty() {
-        return Ok(None);
-    }
-    StsRegionalEndpointsMode::parse(&value).map(Some)
+    crate::util::env::optional_non_empty_var("AWS_STS_REGIONAL_ENDPOINTS")?
+        .as_deref()
+        .map(StsRegionalEndpointsMode::parse)
+        .transpose()
 }
 
 fn web_identity_region_from_env() -> Result<Option<String>, Error> {
-    let value = std::env::var("AWS_REGION")
-        .ok()
-        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok());
+    let value =
+        crate::util::env::optional_first_non_empty_var(&["AWS_REGION", "AWS_DEFAULT_REGION"])?
+            .map(|(_, value)| value);
     let Some(value) = value else {
         return Ok(None);
     };
-    if value.is_empty() {
-        return Ok(None);
-    }
     if value.trim() != value {
         return Err(Error::invalid_config(
             "AWS_REGION or AWS_DEFAULT_REGION must not include leading or trailing whitespace",
@@ -368,28 +354,40 @@ fn resolve_web_identity_sts_endpoint(
 }
 
 fn web_identity_env() -> Result<(String, String, String), Error> {
-    let role_arn =
-        std::env::var("AWS_ROLE_ARN").map_err(|_| Error::invalid_config("missing AWS_ROLE_ARN"))?;
-    let token_file = std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE")
-        .map_err(|_| Error::invalid_config("missing AWS_WEB_IDENTITY_TOKEN_FILE"))?;
-    let session_name =
-        std::env::var("AWS_ROLE_SESSION_NAME").unwrap_or_else(|_| "s3-session".to_string());
+    let role_arn = crate::util::env::required_var("AWS_ROLE_ARN")?;
+    let token_file = crate::util::env::required_non_empty_var("AWS_WEB_IDENTITY_TOKEN_FILE")?;
+    let session_name = crate::util::env::optional_var("AWS_ROLE_SESSION_NAME")?
+        .unwrap_or_else(|| "s3-session".to_string());
 
     validate_assume_role_inputs(&role_arn, &session_name)?;
 
     let token = std::fs::read_to_string(token_file)
         .map_err(|e| Error::invalid_config(format!("failed to read web identity token: {e}")))?;
-    let token = token.trim().to_string();
+    let token = web_identity_token_from_file_contents(&token)?;
+
+    Ok((role_arn, session_name, token))
+}
+
+fn web_identity_token_from_file_contents(contents: &str) -> Result<String, Error> {
+    let token = crate::util::text::strip_trailing_line_ending(contents);
     if token.is_empty() {
         return Err(Error::invalid_config("web identity token is empty"));
     }
-
-    Ok((role_arn, session_name, token))
+    if token
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "web identity token must not contain ASCII control or whitespace characters",
+        ));
+    }
+    Ok(token.to_string())
 }
 
 fn validate_assume_role_inputs(role_arn: &str, role_session_name: &str) -> Result<(), Error> {
     validate_non_empty_no_outer_whitespace("role_arn", role_arn)?;
     validate_non_empty_no_outer_whitespace("role_session_name", role_session_name)?;
+    validate_role_arn(role_arn)?;
 
     let len = role_session_name.len();
     if !(2..=64).contains(&len) {
@@ -408,6 +406,47 @@ fn validate_assume_role_inputs(role_arn: &str, role_session_name: &str) -> Resul
     Ok(())
 }
 
+fn validate_role_arn(role_arn: &str) -> Result<(), Error> {
+    let mut parts = role_arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(region), Some(account), Some(resource)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(Error::invalid_config("role_arn must be an IAM role ARN"));
+    };
+
+    if partition.is_empty()
+        || !partition
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(Error::invalid_config(
+            "role_arn partition must contain only ASCII letters, digits, or '-'",
+        ));
+    }
+    if !region.is_empty() {
+        return Err(Error::invalid_config(
+            "role_arn for IAM roles must not include a region",
+        ));
+    }
+    if account.is_empty() || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::invalid_config(
+            "role_arn account id must contain only digits",
+        ));
+    }
+    if !resource.starts_with("role/") || resource.len() == "role/".len() {
+        return Err(Error::invalid_config(
+            "role_arn resource must start with role/",
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_non_empty_no_outer_whitespace(name: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
         return Err(Error::invalid_config(format!("{name} must not be empty")));
@@ -415,6 +454,14 @@ fn validate_non_empty_no_outer_whitespace(name: &str, value: &str) -> Result<(),
     if value.trim() != value {
         return Err(Error::invalid_config(format!(
             "{name} must not include leading or trailing whitespace"
+        )));
+    }
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(format!(
+            "{name} must not contain ASCII control or whitespace characters"
         )));
     }
     Ok(())
@@ -438,6 +485,15 @@ fn sts_api_error(status: StatusCode, headers: &HeaderMap, body: &str) -> Error {
 }
 
 fn parse_expiration(value: &str) -> Result<OffsetDateTime, Error> {
+    if value.is_empty() {
+        return Err(Error::decode("missing credentials expiration", None));
+    }
+    if value.trim() != value {
+        return Err(Error::decode(
+            "credentials expiration timestamp must not include leading or trailing whitespace",
+            None,
+        ));
+    }
     OffsetDateTime::parse(value, &Rfc3339).map_err(|e| {
         Error::decode(
             "failed to parse credentials expiration timestamp",
@@ -479,7 +535,7 @@ fn parse_assume_role_response(body: &str) -> Result<CredentialsSnapshot, Error> 
         parsed.result.credentials.secret_access_key,
     )?;
     creds = creds.with_session_token(parsed.result.credentials.session_token)?;
-    let expires_at = parse_expiration(parsed.result.credentials.expiration.trim())?;
+    let expires_at = parse_expiration(&parsed.result.credentials.expiration)?;
     Ok(CredentialsSnapshot::new(creds).with_expires_at(expires_at))
 }
 
@@ -520,7 +576,7 @@ fn parse_assume_role_with_web_identity_response(body: &str) -> Result<Credential
         parsed.result.credentials.secret_access_key,
     )?;
     creds = creds.with_session_token(parsed.result.credentials.session_token)?;
-    let expires_at = parse_expiration(parsed.result.credentials.expiration.trim())?;
+    let expires_at = parse_expiration(&parsed.result.credentials.expiration)?;
     Ok(CredentialsSnapshot::new(creds).with_expires_at(expires_at))
 }
 
@@ -728,8 +784,43 @@ mod tests {
         assert!(StsRegionalEndpointsMode::parse(" regional").is_err());
         assert!(validate_assume_role_inputs("arn:aws:iam::123:role/demo", "s3-session").is_ok());
         assert!(validate_assume_role_inputs(" arn:aws:iam::123:role/demo", "s3-session").is_err());
+        assert!(
+            validate_assume_role_inputs("arn:aws:iam::123:role/demo prod", "s3-session").is_err()
+        );
         assert!(validate_assume_role_inputs("arn:aws:iam::123:role/demo", "x").is_err());
         assert!(validate_assume_role_inputs("arn:aws:iam::123:role/demo", "bad space").is_err());
+    }
+
+    #[test]
+    fn role_arn_validation_rejects_non_iam_role_shapes() {
+        assert!(validate_role_arn("arn:aws:iam::123456789012:role/demo/path").is_ok());
+
+        for role_arn in [
+            "not-an-arn",
+            "arn:aws:s3:::bucket",
+            "arn:aws:iam:us-east-1:123456789012:role/demo",
+            "arn:aws:iam::abc:role/demo",
+            "arn:aws:iam::123456789012:user/demo",
+            "arn:aws:iam::123456789012:role/",
+        ] {
+            let err = validate_role_arn(role_arn).expect_err("invalid role ARN must be rejected");
+            match err {
+                Error::InvalidConfig { message } => assert!(message.contains("role_arn")),
+                other => panic!("expected invalid config, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn web_identity_token_file_contents_allow_only_one_clean_line() {
+        assert_eq!(
+            web_identity_token_from_file_contents("header.payload.signature\n").unwrap(),
+            "header.payload.signature"
+        );
+        assert!(web_identity_token_from_file_contents("").is_err());
+        assert!(web_identity_token_from_file_contents(" token").is_err());
+        assert!(web_identity_token_from_file_contents("token\n\n").is_err());
+        assert!(web_identity_token_from_file_contents("token\tvalue").is_err());
     }
 
     #[test]
@@ -756,6 +847,26 @@ mod tests {
             snapshot.expires_at(),
             Some(parse_expiration("2020-01-01T00:00:00Z").unwrap())
         );
+    }
+
+    #[test]
+    fn parse_assume_role_response_rejects_ambiguous_expiration() {
+        let xml = r#"
+ <AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+   <AssumeRoleResult>
+     <Credentials>
+       <AccessKeyId>AKIA_TEST</AccessKeyId>
+       <Expiration>2020-01-01T00:00:00Z </Expiration>
+       <SecretAccessKey>SECRET_TEST</SecretAccessKey>
+       <SessionToken>TOKEN_TEST</SessionToken>
+     </Credentials>
+   </AssumeRoleResult>
+ </AssumeRoleResponse>
+ "#;
+
+        let err =
+            parse_assume_role_response(xml).expect_err("ambiguous expiration must be rejected");
+        assert!(matches!(err, Error::Decode { .. }));
     }
 
     #[test]
@@ -836,6 +947,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sts_response_text_rejects_invalid_utf8_success_body() {
+        let err = sts_response_text(
+            StatusCode::OK,
+            &HeaderMap::new(),
+            &Bytes::from_static(&[0xff]),
+        )
+        .expect_err("successful STS response body must be valid UTF-8");
+
+        match err {
+            Error::Decode { message, .. } => assert!(message.contains("UTF-8")),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sts_response_text_rejects_invalid_utf8_non_success_body() {
+        let err = sts_response_text(
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            &Bytes::from_static(&[0xff]),
+        )
+        .expect_err("STS error response body must be valid UTF-8");
+
+        match err {
+            Error::Decode { message, .. } => assert!(message.contains("UTF-8")),
+            other => panic!("expected decode error, got {other:?}"),
+        }
+    }
+
     #[cfg(feature = "async")]
     #[test]
     fn sts_async_client_accepts_backend_default() {
@@ -866,6 +1007,7 @@ mod tests {
             .map_err(|_| Error::transport("test server thread panicked", None))?;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let body = String::from_utf8(body.to_vec()).expect("test response body should be UTF-8");
         assert!(body.contains("Access Denied"));
         Ok(())
     }
@@ -916,6 +1058,7 @@ mod tests {
             .map_err(|_| Error::transport("test server thread panicked", None))?;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let body = String::from_utf8(body.to_vec()).expect("test response body should be UTF-8");
         assert!(body.contains("Access Denied"));
         Ok(())
     }

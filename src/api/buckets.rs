@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
-use super::common::{create_bucket_location_constraint, validate_subresource};
+use super::common::{
+    create_bucket_location_constraint, parse_async_xml_response, validate_subresource,
+};
 
 use crate::{
     client::Client,
@@ -305,14 +307,10 @@ impl ListBucketsRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_list_buckets(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_list_buckets)
     }
 }
 
@@ -338,7 +336,7 @@ impl HeadBucketRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
         Ok(HeadBucketOutput {
@@ -365,7 +363,7 @@ impl CreateBucketRequest {
     pub async fn send(self) -> Result<CreateBucketOutput> {
         let mut headers = HeaderMap::new();
         let location_constraint =
-            create_bucket_location_constraint(self.location_constraint, self.client.region());
+            create_bucket_location_constraint(self.location_constraint, self.client.region())?;
         let body = match location_constraint {
             Some(region) => {
                 let body = crate::util::xml::encode_create_bucket_configuration(&region)?;
@@ -398,7 +396,7 @@ impl CreateBucketRequest {
             return Ok(CreateBucketOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -427,7 +425,7 @@ impl DeleteBucketRequest {
             return Ok(DeleteBucketOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -453,14 +451,10 @@ impl GetBucketVersioningRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_bucket_versioning(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_bucket_versioning)
     }
 }
 
@@ -507,7 +501,7 @@ impl PutBucketVersioningRequest {
             return Ok(PutBucketVersioningOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -533,14 +527,10 @@ impl GetBucketLifecycleRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_bucket_lifecycle(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_bucket_lifecycle)
     }
 }
 
@@ -624,7 +614,7 @@ impl PutBucketLifecycleRequest {
             return Ok(PutBucketLifecycleOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -653,7 +643,7 @@ impl DeleteBucketLifecycleRequest {
             return Ok(DeleteBucketLifecycleOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -679,14 +669,10 @@ impl GetBucketCorsRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_bucket_cors(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_bucket_cors)
     }
 }
 
@@ -733,7 +719,7 @@ impl PutBucketCorsRequest {
             return Ok(PutBucketCorsOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -762,7 +748,7 @@ impl DeleteBucketCorsRequest {
             return Ok(DeleteBucketCorsOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -788,14 +774,10 @@ impl GetBucketTaggingRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_bucket_tagging(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_bucket_tagging)
     }
 }
 
@@ -842,7 +824,7 @@ impl PutBucketTaggingRequest {
             return Ok(PutBucketTaggingOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -871,7 +853,7 @@ impl DeleteBucketTaggingRequest {
             return Ok(DeleteBucketTaggingOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -897,14 +879,10 @@ impl GetBucketEncryptionRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_bucket_encryption(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_bucket_encryption)
     }
 }
 
@@ -951,7 +929,7 @@ impl PutBucketEncryptionRequest {
             return Ok(PutBucketEncryptionOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -980,7 +958,7 @@ impl DeleteBucketEncryptionRequest {
             return Ok(DeleteBucketEncryptionOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -1006,14 +984,10 @@ impl GetBucketPublicAccessBlockRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_bucket_public_access_block(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_bucket_public_access_block)
     }
 }
 
@@ -1060,7 +1034,7 @@ impl PutBucketPublicAccessBlockRequest {
             return Ok(PutBucketPublicAccessBlockOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -1089,7 +1063,7 @@ impl DeleteBucketPublicAccessBlockRequest {
             return Ok(DeleteBucketPublicAccessBlockOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -1118,12 +1092,10 @@ impl GetBucketConfigRawRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
         resp.text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))
     }
 }
 
@@ -1183,7 +1155,7 @@ impl PutBucketConfigRawRequest {
             return Ok(());
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -1215,6 +1187,6 @@ impl DeleteBucketConfigRawRequest {
             return Ok(());
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }

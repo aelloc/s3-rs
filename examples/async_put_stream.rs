@@ -56,7 +56,10 @@ async fn main() -> Result<(), s3::Error> {
     let chunk1 = Bytes::from_static(b"hello ");
     let chunk2 = Bytes::from_static(b"stream\n");
     let content_length = (chunk1.len() + chunk2.len()) as u64;
-    let body = stream::iter([Ok(chunk1), Ok(chunk2)]);
+    let body = stream::iter([
+        Ok::<_, std::io::Error>(chunk1),
+        Ok::<_, std::io::Error>(chunk2),
+    ]);
 
     client
         .objects()

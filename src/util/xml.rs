@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     error::Error,
@@ -25,19 +26,84 @@ pub(crate) fn parse_error_xml(body: &str) -> Option<xml::XmlError> {
 }
 
 fn extract_error_fragment(body: &str) -> Option<&str> {
-    let start = find_error_start(body)?;
-    let open_end = body[start..].find('>')? + start;
-    let close_start = body[open_end + 1..].find("</Error>")? + open_end + 1;
-    let close_end = close_start + "</Error>".len();
-    body.get(start..close_end)
+    let root_start = find_root_element_start(body)?;
+    let root_name = element_name(body, root_start)?;
+
+    match local_xml_name(root_name) {
+        "Error" => extract_element_fragment(body, root_start, root_name),
+        "ErrorResponse" => {
+            let root = extract_element_fragment(body, root_start, root_name)?;
+            let error_start = find_element_start(root, "Error")?;
+            let error_name = element_name(root, error_start)?;
+            extract_element_fragment(root, error_start, error_name)
+        }
+        _ => None,
+    }
 }
 
-fn find_error_start(body: &str) -> Option<usize> {
-    body.find("<Error>")
-        .or_else(|| body.find("<Error "))
-        .or_else(|| body.find("<Error\n"))
-        .or_else(|| body.find("<Error\r"))
-        .or_else(|| body.find("<Error\t"))
+fn find_root_element_start(body: &str) -> Option<usize> {
+    let mut offset = 0;
+    loop {
+        let rest = body.get(offset..)?;
+        let relative_start = rest.find('<')?;
+        let start = offset + relative_start;
+        if !body.get(offset..start)?.trim().is_empty() {
+            return None;
+        }
+
+        let tail = body.get(start..)?;
+        if tail.starts_with("<?") {
+            offset = start + tail.find("?>")? + 2;
+            continue;
+        }
+        if tail.starts_with("<!--") {
+            offset = start + tail.find("-->")? + 3;
+            continue;
+        }
+        if tail.starts_with("<!") {
+            offset = start + tail.find('>')? + 1;
+            continue;
+        }
+
+        return Some(start);
+    }
+}
+
+fn find_element_start(body: &str, local_name: &str) -> Option<usize> {
+    let mut offset = 0;
+    loop {
+        let start = offset + body.get(offset..)?.find('<')?;
+        if let Some(name) = element_name(body, start)
+            && local_xml_name(name) == local_name
+        {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+}
+
+fn element_name(body: &str, start: usize) -> Option<&str> {
+    let after_lt = body.get(start + 1..)?;
+    if after_lt.starts_with('/') || after_lt.starts_with('?') || after_lt.starts_with('!') {
+        return None;
+    }
+    let end = after_lt
+        .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
+        .unwrap_or(after_lt.len());
+    let name = after_lt.get(..end)?;
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn local_xml_name(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
+}
+
+fn extract_element_fragment<'a>(body: &'a str, start: usize, name: &str) -> Option<&'a str> {
+    let open_end = body.get(start..)?.find('>')? + start;
+    let close_tag = format!("</{name}>");
+    let close_start = body.get(open_end + 1..)?.find(&close_tag)? + open_end + 1;
+    let close_end = close_start + close_tag.len();
+    body.get(start..close_end)
 }
 
 fn extract_tag_text(body: &str, tag: &str) -> Option<String> {
@@ -312,6 +378,7 @@ pub(crate) fn encode_create_bucket_configuration(region: &str) -> Result<Bytes, 
         "create bucket location constraint must not be empty",
         "create bucket location constraint must not include leading or trailing whitespace",
     )?;
+    crate::auth::Region::new(region)?;
 
     #[derive(serde::Serialize)]
     #[serde(rename = "CreateBucketConfiguration")]
@@ -397,6 +464,7 @@ pub(crate) fn encode_delete_objects(
         ));
     }
     for object in objects {
+        crate::util::url::validate_object_key(&object.key)?;
         if let Some(version_id) = object.version_id.as_deref() {
             crate::util::headers::validate_version_id(version_id)?;
         }
@@ -791,13 +859,24 @@ fn validate_bucket_lifecycle(
         ));
     }
 
+    let mut rule_ids = std::collections::BTreeSet::new();
     for rule in &configuration.rules {
-        if let Some(id) = &rule.id
-            && id.len() > 255
-        {
-            return Err(Error::invalid_config(
-                "bucket lifecycle rule id must be at most 255 bytes",
-            ));
+        if let Some(id) = &rule.id {
+            validate_non_empty_trimmed_field(
+                id,
+                "bucket lifecycle rule id must not be empty",
+                "bucket lifecycle rule id must not include leading or trailing whitespace",
+            )?;
+            if id.len() > 255 {
+                return Err(Error::invalid_config(
+                    "bucket lifecycle rule id must be at most 255 bytes",
+                ));
+            }
+            if !rule_ids.insert(id.as_str()) {
+                return Err(Error::invalid_config(
+                    "bucket lifecycle rule ids must be unique",
+                ));
+            }
         }
         match (rule.expiration_days, rule.expiration_date.as_deref()) {
             (Some(0), _) => {
@@ -815,10 +894,25 @@ fn validate_bucket_lifecycle(
                     "bucket lifecycle rule must include an expiration",
                 ));
             }
-            (Some(_), None) | (None, Some(_)) => {}
+            (Some(_), None) => {}
+            (None, Some(date)) => {
+                validate_lifecycle_expiration_date(date)?;
+            }
         }
     }
 
+    Ok(())
+}
+
+fn validate_lifecycle_expiration_date(value: &str) -> Result<(), Error> {
+    validate_non_empty_trimmed_field(
+        value,
+        "bucket lifecycle expiration_date must not be empty",
+        "bucket lifecycle expiration_date must not include leading or trailing whitespace",
+    )?;
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        Error::invalid_config("bucket lifecycle expiration_date must be an RFC3339 timestamp")
+    })?;
     Ok(())
 }
 
@@ -840,76 +934,122 @@ fn validate_bucket_cors(configuration: &types::BucketCorsConfiguration) -> Resul
                 "bucket cors rule must include at least one allowed method",
             ));
         }
-        if rule
-            .allowed_origins
-            .iter()
-            .any(|value| value.trim().is_empty())
-        {
-            return Err(Error::invalid_config(
-                "bucket cors allowed origins must not be empty",
-            ));
+        let mut origins = std::collections::BTreeSet::new();
+        for origin in &rule.allowed_origins {
+            validate_cors_allowed_origin(origin)?;
+            if !origins.insert(origin.as_str()) {
+                return Err(Error::invalid_config(
+                    "bucket cors allowed origins must be unique",
+                ));
+            }
         }
-        if rule
-            .allowed_origins
-            .iter()
-            .any(|value| value.trim() != value)
-        {
-            return Err(Error::invalid_config(
-                "bucket cors allowed origins must not include leading or trailing whitespace",
-            ));
+
+        let mut methods = std::collections::BTreeSet::new();
+        for method in &rule.allowed_methods {
+            validate_cors_method(method.as_str())?;
+            if !methods.insert(method.as_str()) {
+                return Err(Error::invalid_config(
+                    "bucket cors allowed methods must be unique",
+                ));
+            }
         }
-        if rule
-            .allowed_headers
-            .iter()
-            .any(|value| value.trim().is_empty())
-            || rule
-                .expose_headers
-                .iter()
-                .any(|value| value.trim().is_empty())
-        {
-            return Err(Error::invalid_config(
-                "bucket cors header names must not be empty",
-            ));
+
+        let mut allowed_headers = std::collections::BTreeSet::new();
+        for header in &rule.allowed_headers {
+            validate_cors_allowed_header(header)?;
+            if !allowed_headers.insert(header.to_ascii_lowercase()) {
+                return Err(Error::invalid_config(
+                    "bucket cors allowed headers must be unique",
+                ));
+            }
         }
-        if rule
-            .allowed_headers
-            .iter()
-            .chain(rule.expose_headers.iter())
-            .any(|value| value.trim() != value)
-        {
-            return Err(Error::invalid_config(
-                "bucket cors header names must not include leading or trailing whitespace",
-            ));
-        }
-        if rule
-            .allowed_methods
-            .iter()
-            .any(|method| method.as_str().trim().is_empty())
-        {
-            return Err(Error::invalid_config(
-                "bucket cors allowed methods must not be empty",
-            ));
-        }
-        if rule
-            .allowed_methods
-            .iter()
-            .any(|method| method.as_str().trim() != method.as_str())
-        {
-            return Err(Error::invalid_config(
-                "bucket cors allowed methods must not include leading or trailing whitespace",
-            ));
-        }
-        if rule
-            .allowed_methods
-            .iter()
-            .any(|method| http::Method::from_bytes(method.as_str().as_bytes()).is_err())
-        {
-            return Err(Error::invalid_config(
-                "bucket cors allowed methods must be valid HTTP method tokens",
-            ));
+
+        let mut expose_headers = std::collections::BTreeSet::new();
+        for header in &rule.expose_headers {
+            validate_cors_expose_header(header)?;
+            if !expose_headers.insert(header.to_ascii_lowercase()) {
+                return Err(Error::invalid_config(
+                    "bucket cors expose headers must be unique",
+                ));
+            }
         }
     }
 
+    Ok(())
+}
+
+fn validate_cors_allowed_origin(value: &str) -> Result<(), Error> {
+    validate_non_empty_trimmed_field(
+        value,
+        "bucket cors allowed origins must not be empty",
+        "bucket cors allowed origins must not include leading or trailing whitespace",
+    )?;
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "bucket cors allowed origins must not contain ASCII control or whitespace characters",
+        ));
+    }
+    if value.bytes().filter(|b| *b == b'*').count() > 1 {
+        return Err(Error::invalid_config(
+            "bucket cors allowed origins must contain at most one wildcard",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cors_method(value: &str) -> Result<(), Error> {
+    validate_non_empty_trimmed_field(
+        value,
+        "bucket cors allowed methods must not be empty",
+        "bucket cors allowed methods must not include leading or trailing whitespace",
+    )?;
+    if http::Method::from_bytes(value.as_bytes()).is_err() {
+        return Err(Error::invalid_config(
+            "bucket cors allowed methods must be valid HTTP method tokens",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cors_allowed_header(value: &str) -> Result<(), Error> {
+    validate_non_empty_trimmed_field(
+        value,
+        "bucket cors header names must not be empty",
+        "bucket cors header names must not include leading or trailing whitespace",
+    )?;
+    if value.bytes().filter(|b| *b == b'*').count() > 1 {
+        return Err(Error::invalid_config(
+            "bucket cors allowed headers must contain at most one wildcard",
+        ));
+    }
+    let header_name = value.replace('*', "x");
+    if http::HeaderName::from_bytes(header_name.as_bytes()).is_err() {
+        return Err(Error::invalid_config(
+            "bucket cors allowed headers must be valid HTTP header patterns",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cors_expose_header(value: &str) -> Result<(), Error> {
+    validate_non_empty_trimmed_field(
+        value,
+        "bucket cors header names must not be empty",
+        "bucket cors header names must not include leading or trailing whitespace",
+    )?;
+    if value.contains('*') {
+        return Err(Error::invalid_config(
+            "bucket cors expose headers must not contain wildcards",
+        ));
+    }
+    if http::HeaderName::from_bytes(value.as_bytes()).is_err() {
+        return Err(Error::invalid_config(
+            "bucket cors expose headers must be valid HTTP header tokens",
+        ));
+    }
     Ok(())
 }
 
@@ -920,9 +1060,13 @@ fn validate_bucket_tagging(tagging: &types::BucketTagging) -> Result<(), Error> 
         ));
     }
 
+    let mut keys = std::collections::BTreeSet::new();
     for tag in &tagging.tags {
         if tag.key.trim().is_empty() {
             return Err(Error::invalid_config("bucket tag key must not be empty"));
+        }
+        if !keys.insert(tag.key.as_str()) {
+            return Err(Error::invalid_config("bucket tag keys must be unique"));
         }
         if tag.key.len() > 128 {
             return Err(Error::invalid_config(
@@ -1059,6 +1203,10 @@ mod tests {
     use super::*;
     use crate::types::DeleteObjectIdentifier;
 
+    fn encoded_xml_to_string(xml: Bytes) -> String {
+        String::from_utf8(xml.to_vec()).expect("XML encoder should produce valid UTF-8")
+    }
+
     #[test]
     fn parses_error_xml() {
         let xml = r#"
@@ -1099,6 +1247,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_error_xml_after_declaration_and_comments() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- generated by compatible storage -->
+<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Code>NoSuchBucket</Code>
+  <RequestId>req-xml</RequestId>
+</Error>
+"#;
+
+        let err = parse_error_xml(xml).expect("root error should parse");
+        assert_eq!(err.code.as_deref(), Some("NoSuchBucket"));
+        assert_eq!(err.request_id.as_deref(), Some("req-xml"));
+    }
+
+    #[test]
     fn parses_error_xml_with_request_id_only() {
         let xml = r#"
 <Error>
@@ -1117,6 +1280,23 @@ mod tests {
 <ListBucketResult>
   <Name>bucket-a</Name>
 </ListBucketResult>
+"#;
+        assert!(parse_error_xml(xml).is_none());
+    }
+
+    #[test]
+    fn ignores_nested_delete_result_errors() {
+        let xml = r#"
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Deleted>
+    <Key>a</Key>
+  </Deleted>
+  <Error>
+    <Key>b</Key>
+    <Code>AccessDenied</Code>
+    <Message>Access Denied</Message>
+  </Error>
+</DeleteResult>
 "#;
         assert!(parse_error_xml(xml).is_none());
     }
@@ -1405,7 +1585,7 @@ mod tests {
             DeleteObjectIdentifier::new("b.txt").with_version_id("v1"),
         ];
         let xml = encode_delete_objects(&objects, true).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
 
         assert!(xml.contains("<Delete"));
         assert!(xml.contains("<Quiet>true</Quiet>"));
@@ -1437,13 +1617,25 @@ mod tests {
     }
 
     #[test]
+    fn encode_delete_objects_rejects_invalid_keys() {
+        assert_invalid_config(
+            encode_delete_objects(&[DeleteObjectIdentifier::new("")], false),
+            "object key",
+        );
+        assert_invalid_config(
+            encode_delete_objects(&[DeleteObjectIdentifier::new("a/../b")], false),
+            "path segments",
+        );
+    }
+
+    #[test]
     fn encodes_bucket_versioning() {
         let cfg = types::BucketVersioningConfiguration {
             status: Some(types::BucketVersioningStatus::Enabled),
             mfa_delete: Some(types::BucketMfaDeleteStatus::Disabled),
         };
         let xml = encode_bucket_versioning(&cfg).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<VersioningConfiguration"));
         assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
         assert!(xml.contains("<Status>Enabled</Status>"));
@@ -1453,7 +1645,7 @@ mod tests {
     #[test]
     fn encodes_create_bucket_configuration() {
         let xml = encode_create_bucket_configuration("eu-central-1").unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<CreateBucketConfiguration"));
         assert!(xml.contains("xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\""));
         assert!(xml.contains("<LocationConstraint>eu-central-1</LocationConstraint>"));
@@ -1462,6 +1654,7 @@ mod tests {
             encode_create_bucket_configuration(" eu-central-1"),
             "whitespace",
         );
+        assert_invalid_config(encode_create_bucket_configuration("eu central 1"), "region");
     }
 
     #[test]
@@ -1477,7 +1670,7 @@ mod tests {
         };
 
         let xml = encode_bucket_lifecycle(&cfg).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<LifecycleConfiguration"));
         assert!(xml.contains("<Rule>"));
         assert!(xml.contains("<ID>rule-1</ID>"));
@@ -1514,24 +1707,60 @@ mod tests {
     }
 
     #[test]
+    fn encode_bucket_lifecycle_rejects_invalid_rule_ids_and_dates() {
+        let mut rule = types::BucketLifecycleRule {
+            id: Some(" ".to_string()),
+            status: types::BucketLifecycleStatus::Enabled,
+            prefix: Some("logs/".to_string()),
+            expiration_days: Some(30),
+            expiration_date: None,
+        };
+        let cfg = types::BucketLifecycleConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "rule id");
+
+        rule.id = Some("rule-a".to_string());
+        rule.expiration_days = None;
+        rule.expiration_date = Some(" ".to_string());
+        let cfg = types::BucketLifecycleConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "expiration_date");
+
+        rule.expiration_date = Some("2026-01-01".to_string());
+        let cfg = types::BucketLifecycleConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "RFC3339");
+
+        rule.expiration_date = Some("2026-01-01T00:00:00Z".to_string());
+        let cfg = types::BucketLifecycleConfiguration {
+            rules: vec![rule.clone(), rule],
+        };
+        assert_invalid_config(encode_bucket_lifecycle(&cfg), "unique");
+    }
+
+    #[test]
     fn encodes_bucket_cors() {
         let cfg = types::BucketCorsConfiguration {
             rules: vec![types::BucketCorsRule {
                 id: Some("rule-1".to_string()),
                 allowed_origins: vec!["*".to_string()],
                 allowed_methods: vec![types::CorsMethod::Get, types::CorsMethod::Put],
-                allowed_headers: vec!["*".to_string()],
+                allowed_headers: vec!["*".to_string(), "x-amz-*".to_string()],
                 expose_headers: vec!["ETag".to_string()],
                 max_age_seconds: Some(3000),
             }],
         };
 
         let xml = encode_bucket_cors(&cfg).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<CORSConfiguration"));
         assert!(xml.contains("<AllowedOrigin>*</AllowedOrigin>"));
         assert!(xml.contains("<AllowedMethod>GET</AllowedMethod>"));
         assert!(xml.contains("<AllowedMethod>PUT</AllowedMethod>"));
+        assert!(xml.contains("<AllowedHeader>x-amz-*</AllowedHeader>"));
     }
 
     #[test]
@@ -1576,12 +1805,59 @@ mod tests {
         };
         assert_invalid_config(encode_bucket_cors(&cfg), "allowed origins");
 
+        rule.allowed_origins = vec!["https://bad host.example".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "allowed origins");
+
+        rule.allowed_origins = vec!["https://*.bad.*.example".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "wildcard");
+
         rule.allowed_origins = vec!["https://example.com".to_string()];
         rule.allowed_headers = vec![" X-Test".to_string()];
         let cfg = types::BucketCorsConfiguration {
             rules: vec![rule.clone()],
         };
         assert_invalid_config(encode_bucket_cors(&cfg), "header names");
+
+        rule.allowed_headers = vec!["Bad Header".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "valid HTTP header");
+
+        rule.allowed_headers = vec!["x-*-*".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "wildcard");
+
+        rule.allowed_headers = vec!["X-Test".to_string(), "x-test".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "unique");
+
+        rule.allowed_headers.clear();
+        rule.expose_headers = vec!["*".to_string()];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "expose headers");
+
+        rule.expose_headers.clear();
+        rule.allowed_methods = vec![
+            types::CorsMethod::Get,
+            types::CorsMethod::Other("GET".to_string()),
+        ];
+        let cfg = types::BucketCorsConfiguration {
+            rules: vec![rule.clone()],
+        };
+        assert_invalid_config(encode_bucket_cors(&cfg), "unique");
 
         rule.allowed_headers.clear();
         rule.allowed_methods = vec![types::CorsMethod::Other(" GET".to_string())];
@@ -1598,7 +1874,7 @@ mod tests {
             }],
         };
         let xml = encode_bucket_tagging(&cfg).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<Tagging"));
         assert!(xml.contains("<Key>k</Key>"));
         assert!(xml.contains("<Value>v</Value>"));
@@ -1623,6 +1899,20 @@ mod tests {
                 .collect(),
         };
         assert_invalid_config(encode_bucket_tagging(&cfg), "at most 50");
+
+        let cfg = types::BucketTagging {
+            tags: vec![
+                types::Tag {
+                    key: "k".to_string(),
+                    value: "v1".to_string(),
+                },
+                types::Tag {
+                    key: "k".to_string(),
+                    value: "v2".to_string(),
+                },
+            ],
+        };
+        assert_invalid_config(encode_bucket_tagging(&cfg), "unique");
     }
 
     #[test]
@@ -1637,7 +1927,7 @@ mod tests {
             }],
         };
         let xml = encode_bucket_encryption(&cfg).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<ServerSideEncryptionConfiguration"));
         assert!(xml.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"));
         assert!(xml.contains("<KMSMasterKeyID>key-id</KMSMasterKeyID>"));
@@ -1693,7 +1983,7 @@ mod tests {
             restrict_public_buckets: false,
         };
         let xml = encode_bucket_public_access_block(&cfg).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<PublicAccessBlockConfiguration"));
         assert!(xml.contains("<BlockPublicAcls>true</BlockPublicAcls>"));
         assert!(xml.contains("<IgnorePublicAcls>false</IgnorePublicAcls>"));
@@ -1713,7 +2003,7 @@ mod tests {
             },
         ];
         let xml = encode_complete_multipart_upload(&parts).unwrap();
-        let xml = String::from_utf8_lossy(&xml).to_string();
+        let xml = encoded_xml_to_string(xml);
         assert!(xml.contains("<CompleteMultipartUpload"));
         assert!(xml.contains("<PartNumber>1</PartNumber>"));
         assert!(xml.contains("<ETag>\"etag1\"</ETag>"));

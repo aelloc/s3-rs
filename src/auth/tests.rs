@@ -26,7 +26,15 @@ fn region_validates_non_empty() {
     assert!(Region::new("   ").is_err());
     assert!(Region::new(" us-east-1").is_err());
     assert!(Region::new("us-east-1 ").is_err());
+    assert!(Region::new("us/east/1").is_err());
+    assert!(Region::new("us east 1").is_err());
+    assert!(Region::new("us-east-1\nprod").is_err());
+    assert!(Region::new("us.east.1").is_err());
+    assert!(Region::new("us-east-東京").is_err());
+    assert!(Region::new("US-EAST-1").is_err());
+    assert!(Region::new("us_east_1").is_err());
     assert!(Region::new("us-east-1").is_ok());
+    assert!(Region::new("auto").is_ok());
 }
 
 #[test]
@@ -35,12 +43,18 @@ fn credentials_validate_and_redact_in_debug() {
     assert!(Credentials::new("akid", "").is_err());
     assert!(Credentials::new(" akid", "secret").is_err());
     assert!(Credentials::new("akid", "secret\n").is_err());
+    assert!(Credentials::new("akid\tprod", "secret").is_err());
+    assert!(Credentials::new("akid", "sec ret").is_err());
+    assert!(Credentials::new("akidé", "secret").is_err());
+    assert!(Credentials::new("akid", "secreté").is_err());
 
     let creds = Credentials::new("AKIA1234567890", "SECRET1234567890")
         .unwrap()
         .with_session_token("TOKEN1234567890")
         .unwrap();
     assert!(creds.clone().with_session_token(" TOKEN").is_err());
+    assert!(creds.clone().with_session_token("TOK\nEN").is_err());
+    assert!(creds.clone().with_session_token("TOKÉN").is_err());
 
     let dbg = format!("{creds:?}");
     assert!(!dbg.contains("SECRET1234567890"));
@@ -291,6 +305,24 @@ async fn cached_provider_refresh_before_and_throttle_async() {
 
 #[cfg(feature = "async")]
 #[tokio::test]
+async fn cached_provider_huge_refresh_before_does_not_overflow_async() {
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let inner = CountingOkProvider::new(calls.clone());
+    let initial = CredentialsSnapshot::new(Credentials::new("OLD", "SECRET_TEST").unwrap())
+        .with_expires_at(time::OffsetDateTime::now_utc() + time::Duration::seconds(60));
+    let cached = CachedProvider::new(inner)
+        .refresh_before(Duration::MAX)
+        .min_refresh_interval(Duration::from_secs(0))
+        .with_initial(initial);
+
+    let snapshot = cached.credentials_async().await.unwrap();
+
+    assert_eq!(snapshot.credentials().access_key_id, "AKIA_0");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
 async fn cached_provider_force_refresh_bypasses_throttle_async() {
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
     let inner = CountingOkProvider::new(calls.clone());
@@ -490,6 +522,24 @@ fn cached_provider_refresh_before_and_throttle_blocking() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(first.credentials().access_key_id, "STALE");
     assert_eq!(second.credentials().access_key_id, "STALE");
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn cached_provider_huge_refresh_before_does_not_overflow_blocking() {
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let inner = CountingOkProvider::new(calls.clone());
+    let initial = CredentialsSnapshot::new(Credentials::new("OLD", "SECRET_TEST").unwrap())
+        .with_expires_at(time::OffsetDateTime::now_utc() + time::Duration::seconds(60));
+    let cached = CachedProvider::new(inner)
+        .refresh_before(Duration::MAX)
+        .min_refresh_interval(Duration::from_secs(0))
+        .with_initial(initial);
+
+    let snapshot = cached.credentials_blocking().unwrap();
+
+    assert_eq!(snapshot.credentials().access_key_id, "AKIA_0");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(feature = "blocking")]

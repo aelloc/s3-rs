@@ -164,7 +164,9 @@ impl GetObjectOutput {
             writer.write_all(&chunk).await.map_err(|e| {
                 Error::transport("failed to write response body", Some(Box::new(e)))
             })?;
-            written = written.saturating_add(chunk.len() as u64);
+            written = written
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| Error::transport("response body length overflow", None))?;
         }
 
         writer
@@ -223,26 +225,42 @@ impl ChecksumAlgorithm {
             Self::Sha256 => http::header::HeaderName::from_static("x-amz-checksum-sha256"),
         }
     }
+
+    const fn digest_len(self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Crc64Nvme => 8,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
 }
 
 #[cfg(feature = "checksums")]
 /// Checksum value to send with a request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checksum {
-    /// Checksum algorithm.
-    pub algorithm: ChecksumAlgorithm,
-    /// Base64-encoded checksum value.
-    pub value: String,
+    algorithm: ChecksumAlgorithm,
+    value: String,
 }
 
 #[cfg(feature = "checksums")]
 impl Checksum {
-    /// Creates a checksum with a pre-encoded value.
-    pub fn new(algorithm: ChecksumAlgorithm, value: impl Into<String>) -> Self {
-        Self {
-            algorithm,
-            value: value.into(),
-        }
+    /// Creates a checksum from a standard base64-encoded digest.
+    pub fn new(algorithm: ChecksumAlgorithm, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_checksum_value(algorithm, &value)?;
+        Ok(Self { algorithm, value })
+    }
+
+    /// Returns the checksum algorithm.
+    pub fn algorithm(&self) -> ChecksumAlgorithm {
+        self.algorithm
+    }
+
+    /// Returns the standard base64-encoded checksum value.
+    pub fn value(&self) -> &str {
+        &self.value
     }
 
     /// Computes a checksum from raw bytes.
@@ -286,6 +304,32 @@ impl Checksum {
         headers.insert(self.algorithm.header_name(), value);
         Ok(())
     }
+}
+
+#[cfg(feature = "checksums")]
+fn validate_checksum_value(algorithm: ChecksumAlgorithm, value: &str) -> Result<()> {
+    use base64::Engine as _;
+
+    if value.is_empty() {
+        return Err(Error::invalid_config("checksum value must not be empty"));
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(
+            "checksum value must not include leading or trailing whitespace",
+        ));
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.as_bytes())
+        .map_err(|_| Error::invalid_config("checksum value must be standard base64"))?;
+
+    if decoded.len() != algorithm.digest_len() {
+        return Err(Error::invalid_config(
+            "checksum value length does not match checksum algorithm",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Output from a DELETE object request.
@@ -816,8 +860,8 @@ mod checksum_tests {
         for &(algorithm, bytes, expected) in cases {
             let checksum = Checksum::from_bytes(algorithm, bytes);
 
-            assert_eq!(checksum.algorithm, algorithm);
-            assert_eq!(checksum.value, expected);
+            assert_eq!(checksum.algorithm(), algorithm);
+            assert_eq!(checksum.value(), expected);
         }
     }
 
@@ -848,23 +892,40 @@ mod checksum_tests {
 
         for (algorithm, header_name) in cases {
             let mut headers = HeaderMap::new();
-            Checksum::new(algorithm, "checksum-value")
+            let checksum = Checksum::from_bytes(algorithm, b"hello");
+            let expected = checksum.value().to_string();
+            checksum
                 .apply(&mut headers)
                 .expect("checksum header should be valid");
 
             let value = headers
                 .get(header_name)
                 .expect("checksum header should be present");
-            assert_eq!(value.to_str().ok(), Some("checksum-value"));
+            assert_eq!(value.to_str().ok(), Some(expected.as_str()));
         }
     }
 
     #[test]
-    fn apply_rejects_invalid_header_value() {
-        let mut headers = HeaderMap::new();
-        let result = Checksum::new(ChecksumAlgorithm::Crc32, "invalid\nvalue").apply(&mut headers);
+    fn new_accepts_valid_pre_encoded_checksum() {
+        let checksum = Checksum::new(ChecksumAlgorithm::Crc32, "NhCmhg==")
+            .expect("valid checksum should be accepted");
 
-        assert!(result.is_err());
-        assert!(headers.is_empty());
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc32);
+        assert_eq!(checksum.value(), "NhCmhg==");
+    }
+
+    #[test]
+    fn new_rejects_invalid_checksum_values() {
+        let cases = [
+            (ChecksumAlgorithm::Crc32, ""),
+            (ChecksumAlgorithm::Crc32, " AAAAAA=="),
+            (ChecksumAlgorithm::Crc32, "invalid\nvalue"),
+            (ChecksumAlgorithm::Crc32, "not-base64"),
+            (ChecksumAlgorithm::Crc32, "AAAAAAAAAAA="),
+        ];
+
+        for (algorithm, value) in cases {
+            assert!(Checksum::new(algorithm, value).is_err());
+        }
     }
 }

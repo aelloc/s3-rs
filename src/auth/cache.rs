@@ -115,8 +115,19 @@ where
     }
 
     /// Seeds the cache with an initial snapshot.
-    pub fn with_initial(self, snapshot: CredentialsSnapshot) -> Self {
-        self.set_initial_snapshot(snapshot);
+    pub fn with_initial(mut self, snapshot: CredentialsSnapshot) -> Self {
+        cfg_select! {
+            feature = "async" => {
+                self.state.get_mut().cached = Some(snapshot);
+            }
+            _ => {
+                let state = self
+                    .state
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.cached = Some(snapshot);
+            }
+        }
         self
     }
 
@@ -132,21 +143,6 @@ where
         self.get_blocking(true)
     }
 
-    #[cfg(feature = "async")]
-    fn set_initial_snapshot(&self, snapshot: CredentialsSnapshot) {
-        let mut state = self
-            .state
-            .try_lock()
-            .expect("cache state must be unlocked during initialization");
-        state.cached = Some(snapshot);
-    }
-
-    #[cfg(all(feature = "blocking", not(feature = "async")))]
-    fn set_initial_snapshot(&self, snapshot: CredentialsSnapshot) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        state.cached = Some(snapshot);
-    }
-
     fn should_refresh(
         &self,
         snapshot: &CredentialsSnapshot,
@@ -157,7 +153,13 @@ where
             return true;
         }
         match snapshot.expires_at() {
-            Some(expires_at) => now + self.refresh_before >= expires_at,
+            Some(expires_at) => {
+                let Ok(refresh_before) = time::Duration::try_from(self.refresh_before) else {
+                    return true;
+                };
+                now.checked_add(refresh_before)
+                    .is_none_or(|refresh_at| refresh_at >= expires_at)
+            }
             None => false,
         }
     }

@@ -5,10 +5,14 @@ use std::{
 
 use crate::{auth::Credentials, error::Error};
 
-pub(crate) fn profile_from_env() -> String {
-    std::env::var("AWS_PROFILE")
-        .or_else(|_| std::env::var("AWS_DEFAULT_PROFILE"))
-        .unwrap_or_else(|_| "default".to_string())
+pub(crate) fn profile_from_env() -> Result<String, Error> {
+    if let Some((name, profile)) =
+        crate::util::env::optional_first_var(&["AWS_PROFILE", "AWS_DEFAULT_PROFILE"])?
+    {
+        return validate_profile_name(name, profile);
+    }
+
+    Ok("default".to_string())
 }
 
 pub(crate) fn load_profile_credentials(profile: &str) -> Result<Credentials, Error> {
@@ -47,27 +51,55 @@ pub(crate) fn load_profile_credentials(profile: &str) -> Result<Credentials, Err
     Ok(creds)
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+fn validate_profile_name(name: &'static str, value: String) -> Result<String, Error> {
+    if value.is_empty() {
+        return Err(Error::invalid_config(format!("{name} must not be empty")));
+    }
+    if value.trim() != value {
+        return Err(Error::invalid_config(format!(
+            "{name} must not include leading or trailing whitespace"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(Error::invalid_config(format!(
+            "{name} must not contain control characters"
+        )));
+    }
+    Ok(value)
+}
+
+fn env_path(name: &'static str) -> Result<Option<PathBuf>, Error> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(Error::invalid_config(format!("{name} must not be empty")));
+    }
+    Ok(Some(PathBuf::from(value)))
+}
+
+fn home_dir() -> Result<Option<PathBuf>, Error> {
+    if let Some(path) = env_path("HOME")? {
+        return Ok(Some(path));
+    }
+    env_path("USERPROFILE")
 }
 
 fn default_aws_dir() -> Result<PathBuf, Error> {
-    let home = home_dir().ok_or_else(|| Error::invalid_config("cannot determine home dir"))?;
+    let home = home_dir()?.ok_or_else(|| Error::invalid_config("cannot determine home dir"))?;
     Ok(home.join(".aws"))
 }
 
 fn credentials_path() -> Result<PathBuf, Error> {
-    if let Some(path) = std::env::var_os("AWS_SHARED_CREDENTIALS_FILE") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = env_path("AWS_SHARED_CREDENTIALS_FILE")? {
+        return Ok(path);
     }
     Ok(default_aws_dir()?.join("credentials"))
 }
 
 fn config_path() -> Result<PathBuf, Error> {
-    if let Some(path) = std::env::var_os("AWS_CONFIG_FILE") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = env_path("AWS_CONFIG_FILE")? {
+        return Ok(path);
     }
     Ok(default_aws_dir()?.join("config"))
 }
@@ -195,5 +227,17 @@ ignored = outside
         );
 
         assert!(lookup(&parsed, "default", "ignored").is_none());
+    }
+
+    #[test]
+    fn profile_name_rejects_ambiguous_values() {
+        assert_eq!(
+            validate_profile_name("AWS_PROFILE", "dev profile".to_string()).unwrap(),
+            "dev profile"
+        );
+        assert!(validate_profile_name("AWS_PROFILE", String::new()).is_err());
+        assert!(validate_profile_name("AWS_PROFILE", " dev".to_string()).is_err());
+        assert!(validate_profile_name("AWS_PROFILE", "dev ".to_string()).is_err());
+        assert!(validate_profile_name("AWS_PROFILE", "dev\nprofile".to_string()).is_err());
     }
 }

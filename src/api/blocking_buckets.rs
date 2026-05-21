@@ -3,13 +3,13 @@
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
-use super::blocking_common::read_body_string;
+use super::blocking_common::{parse_blocking_xml_response, read_body_string, read_response_error};
 use super::common::{create_bucket_location_constraint, validate_subresource};
 
 use crate::{
     client::BlockingClient,
     error::{Error, Result},
-    transport::blocking_transport::{BlockingBody, response_error},
+    transport::blocking_transport::BlockingBody,
     types::{
         BucketCorsConfiguration, BucketEncryptionConfiguration, BucketLifecycleConfiguration,
         BucketPublicAccessBlockConfiguration, BucketTagging, BucketVersioningConfiguration,
@@ -310,14 +310,10 @@ impl BlockingListBucketsRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_list_buckets(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_list_buckets)
     }
 }
 
@@ -340,9 +336,7 @@ impl BlockingHeadBucketRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
         Ok(HeadBucketOutput {
@@ -369,7 +363,7 @@ impl BlockingCreateBucketRequest {
     pub fn send(self) -> Result<CreateBucketOutput> {
         let mut headers = HeaderMap::new();
         let location_constraint =
-            create_bucket_location_constraint(self.location_constraint, self.client.region());
+            create_bucket_location_constraint(self.location_constraint, self.client.region())?;
         let body = match location_constraint {
             Some(region) => {
                 let body = crate::util::xml::encode_create_bucket_configuration(&region)?;
@@ -398,10 +392,7 @@ impl BlockingCreateBucketRequest {
         if resp.status() == StatusCode::OK || resp.status() == StatusCode::NO_CONTENT {
             return Ok(CreateBucketOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -426,10 +417,7 @@ impl BlockingDeleteBucketRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(DeleteBucketOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -452,14 +440,10 @@ impl BlockingGetBucketVersioningRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_bucket_versioning(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_bucket_versioning)
     }
 }
 
@@ -502,10 +486,7 @@ impl BlockingPutBucketVersioningRequest {
         if resp.status().is_success() {
             return Ok(PutBucketVersioningOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -528,14 +509,10 @@ impl BlockingGetBucketLifecycleRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_bucket_lifecycle(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_bucket_lifecycle)
     }
 }
 
@@ -614,10 +591,7 @@ impl BlockingPutBucketLifecycleRequest {
         if resp.status().is_success() {
             return Ok(PutBucketLifecycleOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -642,10 +616,7 @@ impl BlockingDeleteBucketLifecycleRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(DeleteBucketLifecycleOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -668,14 +639,10 @@ impl BlockingGetBucketCorsRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_bucket_cors(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_bucket_cors)
     }
 }
 
@@ -718,10 +685,7 @@ impl BlockingPutBucketCorsRequest {
         if resp.status().is_success() {
             return Ok(PutBucketCorsOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -746,10 +710,7 @@ impl BlockingDeleteBucketCorsRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(DeleteBucketCorsOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -772,14 +733,10 @@ impl BlockingGetBucketTaggingRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_bucket_tagging(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_bucket_tagging)
     }
 }
 
@@ -822,10 +779,7 @@ impl BlockingPutBucketTaggingRequest {
         if resp.status().is_success() {
             return Ok(PutBucketTaggingOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -850,10 +804,7 @@ impl BlockingDeleteBucketTaggingRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(DeleteBucketTaggingOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -876,14 +827,10 @@ impl BlockingGetBucketEncryptionRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_bucket_encryption(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_bucket_encryption)
     }
 }
 
@@ -926,10 +873,7 @@ impl BlockingPutBucketEncryptionRequest {
         if resp.status().is_success() {
             return Ok(PutBucketEncryptionOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -954,10 +898,7 @@ impl BlockingDeleteBucketEncryptionRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(DeleteBucketEncryptionOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -980,14 +921,10 @@ impl BlockingGetBucketPublicAccessBlockRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
-        let (_, body) = resp.into_parts();
-        let xml = read_body_string(body)?;
-        crate::util::xml::parse_bucket_public_access_block(&xml)
+        parse_blocking_xml_response(resp, crate::util::xml::parse_bucket_public_access_block)
     }
 }
 
@@ -1030,10 +967,7 @@ impl BlockingPutBucketPublicAccessBlockRequest {
         if resp.status().is_success() {
             return Ok(PutBucketPublicAccessBlockOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -1058,10 +992,7 @@ impl BlockingDeleteBucketPublicAccessBlockRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(DeleteBucketPublicAccessBlockOutput);
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -1087,9 +1018,7 @@ impl BlockingGetBucketConfigRawRequest {
         )?;
 
         if !resp.status().is_success() {
-            let (parts, body) = resp.into_parts();
-            let body = read_body_string(body)?;
-            return Err(response_error(parts.status, &parts.headers, &body));
+            return Err(read_response_error(resp)?);
         }
 
         let (_, body) = resp.into_parts();
@@ -1149,10 +1078,7 @@ impl BlockingPutBucketConfigRawRequest {
         if resp.status().is_success() {
             return Ok(());
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }
 
@@ -1180,9 +1106,6 @@ impl BlockingDeleteBucketConfigRawRequest {
         if resp.status() == StatusCode::NO_CONTENT || resp.status().is_success() {
             return Ok(());
         }
-
-        let (parts, body) = resp.into_parts();
-        let body = read_body_string(body)?;
-        Err(response_error(parts.status, &parts.headers, &body))
+        Err(read_response_error(resp)?)
     }
 }

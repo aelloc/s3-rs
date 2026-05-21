@@ -1,7 +1,8 @@
-use std::{io, pin::Pin, time::Duration};
+use std::{pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use futures_core::Stream;
+use futures_util::TryStreamExt as _;
 use http::header::{CONTENT_LENGTH, USER_AGENT};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use reqx::{
@@ -13,14 +14,43 @@ use crate::{
     error::{Error, Result},
     transport::{
         MAX_BUFFERED_RESPONSE_BODY_BYTES, RequestAttemptState, RequestTimer, RetryConfig,
-        ServiceErrorAction, TransportRequestBody, content_length_header_value, default_tls_backend,
-        ensure_method_accepts_body, map_reqx_error, prepare_user_agent, record_service_retry,
-        reqx_backoff_source, reqx_retry_policy, response_error_from_status, service_error_action,
+        ServiceErrorAction, TransportRequestBody, content_length_header_value,
+        content_length_header_value_from_len, default_tls_backend, ensure_method_accepts_body,
+        map_reqx_error, prepare_user_agent, record_service_retry, reqx_backoff_source,
+        reqx_retry_policy, response_error_from_body, service_error_action,
+        validate_request_timeout,
     },
 };
 
+#[derive(Debug)]
+pub(crate) struct AsyncBodyError {
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl std::fmt::Display for AsyncBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for AsyncBodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 type AsyncByteStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<Bytes, io::Error>> + Send + Sync + 'static>>;
+    Pin<Box<dyn Stream<Item = std::result::Result<Bytes, AsyncBodyError>> + Send + 'static>>;
+
+pub(crate) fn boxed_byte_stream<S, E>(stream: S) -> AsyncByteStream
+where
+    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Box::pin(stream.map_err(|err| AsyncBodyError {
+        source: Box::new(err),
+    }))
+}
 
 pub(crate) enum AsyncBody {
     Empty,
@@ -83,8 +113,12 @@ impl AsyncResponse {
         &self.body
     }
 
-    pub(crate) async fn text(self) -> std::result::Result<String, io::Error> {
-        Ok(String::from_utf8_lossy(&self.body).into_owned())
+    pub(crate) fn into_parts(self) -> (StatusCode, HeaderMap, Bytes) {
+        (self.status, self.headers, self.body)
+    }
+
+    pub(crate) fn text(self) -> Result<String> {
+        crate::util::text::decode_utf8_response_body(self.body.as_ref())
     }
 }
 
@@ -95,6 +129,8 @@ impl AsyncTransport {
         timeout: Option<Duration>,
         tls_root_store: TlsRootStore,
     ) -> Result<Self> {
+        let retry = retry.validate()?;
+        validate_request_timeout(timeout)?;
         let (user_agent_text, user_agent) = prepare_user_agent(user_agent)?;
 
         let mut builder = HttpClient::builder("http://localhost")
@@ -154,7 +190,7 @@ impl AsyncTransport {
                 &method,
                 resp.status(),
                 resp.headers(),
-                &resp.text_lossy(),
+                resp.body(),
             ) {
                 match action {
                     ServiceErrorAction::RetryAfter(delay) => {
@@ -183,10 +219,37 @@ impl AsyncTransport {
         headers: HeaderMap,
         body: AsyncBody,
     ) -> Result<reqx::ResponseStream> {
-        let req = self.build_request(&method, url, headers, body)?;
-        req.send_response_stream()
-            .await
-            .map_err(|err| map_reqx_error("request failed", err))
+        let mut attempts = RequestAttemptState::new(self.retry, body);
+        let max_attempts = attempts.max_attempts();
+        let timer = RequestTimer::start();
+
+        for attempt in 1..=max_attempts {
+            let current_body = attempts.next_body()?;
+            let req = self.build_request(&method, url.clone(), headers.clone(), current_body)?;
+            let resp = req
+                .send_response_stream()
+                .await
+                .map_err(|err| map_reqx_error("request failed", err))?;
+
+            if let Some(ServiceErrorAction::RetryAfter(delay)) = service_error_action(
+                self.retry,
+                attempt,
+                max_attempts,
+                &method,
+                resp.status(),
+                resp.headers(),
+                b"",
+            ) {
+                record_service_retry(&method);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            timer.finish(&method);
+            return Ok(resp);
+        }
+
+        Err(Error::transport("request failed after retries", None))
     }
 
     fn build_request(
@@ -211,7 +274,12 @@ impl AsyncTransport {
 
         req = match body {
             AsyncBody::Empty => req,
-            AsyncBody::Bytes(b) => req.body(b),
+            AsyncBody::Bytes(b) => req
+                .header(
+                    CONTENT_LENGTH,
+                    content_length_header_value_from_len(b.len())?,
+                )
+                .body(b),
             AsyncBody::Stream {
                 stream,
                 content_length: Some(len),
@@ -228,17 +296,16 @@ impl AsyncTransport {
     }
 }
 
-pub(crate) async fn response_error(resp: AsyncResponse) -> Error {
-    let body_str = String::from_utf8_lossy(resp.body()).to_string();
-    response_error_from_status(resp.status(), resp.headers(), &body_str)
+pub(crate) fn response_error(resp: AsyncResponse) -> Error {
+    response_error_from_body(resp.status(), resp.headers(), resp.body())
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::{ErrorKind, Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use super::*;
@@ -246,6 +313,8 @@ mod tests {
     mod reqx {
         pub use ::reqx::advanced::TlsRootStore;
     }
+
+    type RequestCaptureServer = (SocketAddr, std::thread::JoinHandle<()>, Arc<Mutex<Vec<u8>>>);
 
     fn spawn_test_server(
         responses: Vec<Vec<u8>>,
@@ -310,6 +379,98 @@ mod tests {
         });
 
         Ok((addr, handle, hits))
+    }
+
+    fn spawn_request_capture_server(response: Vec<u8>) -> Result<RequestCaptureServer> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| Error::transport("failed to bind test server", Some(Box::new(e))))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| Error::transport("failed to configure test server", Some(Box::new(e))))?;
+        let addr = listener.local_addr().map_err(|e| {
+            Error::transport("failed to read test server address", Some(Box::new(e)))
+        })?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_thread = captured.clone();
+
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => request.extend_from_slice(&buf[..n]),
+                                Err(err)
+                                    if matches!(
+                                        err.kind(),
+                                        ErrorKind::WouldBlock | ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        *captured_thread.lock().expect("capture lock") = request;
+                        let _ = stream.write_all(&response);
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Ok((addr, handle, captured))
+    }
+
+    #[tokio::test]
+    async fn send_bytes_sets_content_length() -> Result<()> {
+        let (addr, handle, captured) = spawn_request_capture_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )?;
+        let transport = AsyncTransport::new(
+            RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::default()
+            },
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        transport
+            .send(
+                Method::PUT,
+                url,
+                HeaderMap::new(),
+                AsyncBody::Bytes(Bytes::from_static(b"abc")),
+            )
+            .await?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        let request = String::from_utf8(captured.lock().expect("capture lock").clone())
+            .map_err(|e| Error::decode("captured request is not valid UTF-8", Some(Box::new(e))))?;
+        let request = request.to_ascii_lowercase();
+        assert_eq!(request.matches("\r\ncontent-length: ").count(), 1);
+        assert!(request.contains("\r\ncontent-length: 3\r\n"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -404,14 +565,16 @@ mod tests {
         let url = Url::parse(&format!("http://{addr}/"))
             .map_err(|_| Error::invalid_config("invalid test server URL"))?;
 
-        let stream = futures_util::stream::once(async { Ok(Bytes::from_static(b"hello")) });
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"hello"))
+        });
         let err = transport
             .send(
                 Method::PUT,
                 url,
                 HeaderMap::new(),
                 AsyncBody::Stream {
-                    stream: Box::pin(stream),
+                    stream: boxed_byte_stream(stream),
                     content_length: Some(5),
                 },
             )
@@ -464,7 +627,7 @@ mod tests {
             .join()
             .map_err(|_| Error::transport("test server thread panicked", None))?;
 
-        let err = response_error(resp).await;
+        let err = response_error(resp);
         match err {
             Error::RateLimited {
                 retry_after,
@@ -516,7 +679,7 @@ mod tests {
             .join()
             .map_err(|_| Error::transport("test server thread panicked", None))?;
 
-        let err = response_error(resp).await;
+        let err = response_error(resp);
         match err {
             Error::Api {
                 status,
@@ -888,8 +1051,8 @@ mod tests {
         let url = Url::parse(&format!("http://{addr}/"))
             .map_err(|_| Error::invalid_config("invalid test server URL"))?;
         let body = AsyncBody::Stream {
-            stream: Box::pin(futures_util::stream::empty::<
-                std::result::Result<Bytes, io::Error>,
+            stream: boxed_byte_stream(futures_util::stream::empty::<
+                std::result::Result<Bytes, std::io::Error>,
             >()),
             content_length: Some(0),
         };
@@ -903,6 +1066,46 @@ mod tests {
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_stream_retries_retryable_status_for_replayable_body() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            max_retry_after: Duration::from_secs(30),
+        };
+        let transport = AsyncTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let mut resp = transport
+            .send_stream(Method::GET, url, HeaderMap::new(), AsyncBody::Empty)
+            .await?;
+        use tokio::io::AsyncReadExt as _;
+        let mut body = Vec::new();
+        resp.read_to_end(&mut body)
+            .await
+            .map_err(|e| Error::transport("body stream error", Some(Box::new(e))))?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body, b"ok");
         Ok(())
     }
 
@@ -933,6 +1136,21 @@ mod tests {
             other => panic!("expected invalid config, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn response_text_rejects_invalid_utf8() {
+        let resp = AsyncResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(&[0xff]),
+        };
+
+        let err = resp.text().expect_err("invalid UTF-8 must fail");
+        match err {
+            Error::Decode { message, .. } => assert!(message.contains("UTF-8")),
+            other => panic!("expected decode error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

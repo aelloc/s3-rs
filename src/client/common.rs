@@ -35,6 +35,23 @@ pub(crate) fn sign_with_snapshot(
 }
 
 pub(crate) fn parse_endpoint(endpoint: &str) -> Result<Url> {
+    if endpoint.is_empty() {
+        return Err(Error::invalid_config("endpoint must not be empty"));
+    }
+    if endpoint.trim() != endpoint {
+        return Err(Error::invalid_config(
+            "endpoint must not include leading or trailing whitespace",
+        ));
+    }
+    if endpoint
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "endpoint must not contain ASCII control or whitespace characters",
+        ));
+    }
+
     let endpoint = Url::parse(endpoint)
         .map_err(|_| Error::invalid_config("endpoint must be a valid absolute URL"))?;
 
@@ -153,6 +170,23 @@ mod tests {
                 );
             }
             other => panic!("expected invalid config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_ambiguous_whitespace() {
+        for endpoint in [
+            "",
+            " https://s3.example.com",
+            "https://s3.example.com ",
+            "https://s3.example.com/\n",
+            "https://s3.example.com/a b",
+        ] {
+            let err = parse_endpoint(endpoint).expect_err("ambiguous endpoint must be rejected");
+            match err {
+                Error::InvalidConfig { .. } => {}
+                other => panic!("expected invalid config, got {other:?}"),
+            }
         }
     }
 }

@@ -33,16 +33,21 @@ impl MetadataCredentials {
         let expiration = self
             .expiration
             .ok_or_else(|| Error::decode("missing credentials expiration", None))?;
-        let expiration = expiration.trim();
-        if expiration.is_empty() {
-            return Err(Error::decode("missing credentials expiration", None));
-        }
-        let expires_at = parse_expiration(expiration)?;
+        let expires_at = parse_expiration(&expiration)?;
         Ok(CredentialsSnapshot::new(creds).with_expires_at(expires_at))
     }
 }
 
 fn parse_expiration(value: &str) -> Result<OffsetDateTime, Error> {
+    if value.is_empty() {
+        return Err(Error::decode("missing credentials expiration", None));
+    }
+    if value.trim() != value {
+        return Err(Error::decode(
+            "credentials expiration timestamp must not include leading or trailing whitespace",
+            None,
+        ));
+    }
     OffsetDateTime::parse(value, &Rfc3339).map_err(|e| {
         Error::decode(
             "failed to parse credentials expiration timestamp",
@@ -52,6 +57,14 @@ fn parse_expiration(value: &str) -> Result<OffsetDateTime, Error> {
 }
 
 fn parse_container_credentials_full_uri(value: &str) -> Result<url::Url, Error> {
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI must not contain ASCII control or whitespace characters",
+        ));
+    }
     let uri = url::Url::parse(value)
         .map_err(|_| Error::invalid_config("AWS_CONTAINER_CREDENTIALS_FULL_URI is invalid"))?;
     let scheme = uri.scheme();
@@ -64,6 +77,16 @@ fn parse_container_credentials_full_uri(value: &str) -> Result<url::Url, Error> 
     if uri.host_str().is_none() {
         return Err(Error::invalid_config(
             "AWS_CONTAINER_CREDENTIALS_FULL_URI must include host",
+        ));
+    }
+    if !uri.username().is_empty() || uri.password().is_some() {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI must not include user info",
+        ));
+    }
+    if uri.fragment().is_some() {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI must not include a fragment",
         ));
     }
 
@@ -87,6 +110,14 @@ fn parse_container_credentials_relative_uri(value: &str) -> Result<String, Error
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must not include leading or trailing whitespace",
         ));
     }
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must not contain ASCII control or whitespace characters",
+        ));
+    }
     if !value.starts_with('/') {
         return Err(Error::invalid_config(
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must start with '/'",
@@ -99,6 +130,11 @@ fn parse_container_credentials_relative_uri(value: &str) -> Result<String, Error
     if uri.host_str() != Some("169.254.170.2") {
         return Err(Error::invalid_config(
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI resolved to an unexpected host",
+        ));
+    }
+    if uri.fragment().is_some() {
+        return Err(Error::invalid_config(
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must not include a fragment",
         ));
     }
     Ok(value.to_string())
@@ -122,11 +158,12 @@ fn imds_v1_disabled_value(value: &str) -> bool {
     value == "1" || value.eq_ignore_ascii_case("true")
 }
 
-fn imds_v1_fallback_allowed() -> bool {
-    !std::env::var("AWS_EC2_METADATA_V1_DISABLED")
-        .ok()
-        .as_deref()
-        .is_some_and(imds_v1_disabled_value)
+fn imds_v1_fallback_allowed() -> Result<bool, Error> {
+    Ok(
+        !crate::util::env::optional_var("AWS_EC2_METADATA_V1_DISABLED")?
+            .as_deref()
+            .is_some_and(imds_v1_disabled_value),
+    )
 }
 
 fn should_fallback_to_imds_v1_from_token_error(err: &Error) -> bool {
@@ -144,9 +181,8 @@ pub(crate) async fn load_async(tls_root_store: TlsRootStore) -> Result<Credentia
 
     let client = metadata_async_client(Duration::from_secs(2), tls_root_store)?;
 
-    if let Some(full) = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
-        .ok()
-        .filter(|v| !v.is_empty())
+    if let Some(full) =
+        crate::util::env::optional_non_empty_var("AWS_CONTAINER_CREDENTIALS_FULL_URI")?
     {
         let full = parse_container_credentials_full_uri(&full)?;
         let headers = container_auth_headers()?;
@@ -160,9 +196,8 @@ pub(crate) async fn load_async(tls_root_store: TlsRootStore) -> Result<Credentia
         return parsed.into_snapshot();
     }
 
-    if let Some(rel) = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
-        .ok()
-        .filter(|v| !v.is_empty())
+    if let Some(rel) =
+        crate::util::env::optional_non_empty_var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")?
     {
         let rel = parse_container_credentials_relative_uri(&rel)?;
         let url = format!("http://169.254.170.2{rel}");
@@ -179,10 +214,12 @@ pub(crate) async fn load_async(tls_root_store: TlsRootStore) -> Result<Credentia
 
     let token = match fetch_imds_v2_token(&client).await {
         Ok(token) => Some(token),
-        Err(err)
-            if imds_v1_fallback_allowed() && should_fallback_to_imds_v1_from_token_error(&err) =>
-        {
-            None
+        Err(err) if should_fallback_to_imds_v1_from_token_error(&err) => {
+            if imds_v1_fallback_allowed()? {
+                None
+            } else {
+                return Err(err);
+            }
         }
         Err(err) => return Err(err),
     };
@@ -199,10 +236,8 @@ pub(crate) async fn load_async(tls_root_store: TlsRootStore) -> Result<Credentia
         headers.clone(),
     )
     .await?;
-    let role = role.lines().next().unwrap_or("").trim();
-    if role.is_empty() {
-        return Err(Error::invalid_config("missing IMDS role name"));
-    }
+    let role = imds_role_name_from_body(&role)?;
+    let role = crate::util::encode::aws_percent_encode(&role);
 
     let url = format!("http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}");
     let body = http_get_text(&client, &url, headers).await?;
@@ -232,14 +267,13 @@ async fn http_get_text(
         .await
         .map_err(|e| crate::transport::map_reqx_error("request failed", e))?;
     let status = resp.status();
-    let body = String::from_utf8_lossy(resp.body()).to_string();
     if status.is_success() {
-        return Ok(body);
+        return crate::util::text::decode_utf8_response_body(resp.body());
     }
-    Err(crate::transport::response_error_from_status(
+    Err(crate::transport::response_error_from_body(
         status,
         resp.headers(),
-        &body,
+        resp.body(),
     ))
 }
 
@@ -260,34 +294,37 @@ async fn fetch_imds_v2_token(client: &reqx::Client) -> Result<String, Error> {
         .await
         .map_err(|e| crate::transport::map_reqx_error("request failed", e))?;
     let status = resp.status();
-    let body = String::from_utf8_lossy(resp.body()).to_string();
     if status.is_success() {
-        return Ok(body.trim().to_string());
+        return imds_token_from_body(resp.body());
     }
-    Err(crate::transport::response_error_from_status(
+    Err(crate::transport::response_error_from_body(
         status,
         resp.headers(),
-        &body,
+        resp.body(),
     ))
 }
 
-#[cfg(feature = "async")]
+#[cfg(any(feature = "async", feature = "blocking"))]
 fn container_auth_headers() -> Result<http::HeaderMap, Error> {
     let mut headers = http::HeaderMap::new();
-    if let Ok(token) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
-        if !token.trim().is_empty() {
-            let value = http::HeaderValue::from_str(token.trim())
-                .map_err(|_| Error::invalid_config("invalid container authorization token"))?;
-            headers.insert(http::header::AUTHORIZATION, value);
-        }
-    } else if let Ok(path) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
+    if let Some(token) = crate::util::env::optional_var("AWS_CONTAINER_AUTHORIZATION_TOKEN")? {
+        let value = container_authorization_header_value(
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            &token,
+            false,
+        )?;
+        headers.insert(http::header::AUTHORIZATION, value);
+    } else if let Some(path) =
+        crate::util::env::optional_var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")?
+    {
         let token = std::fs::read_to_string(path)
             .map_err(|e| Error::invalid_config(format!("failed to read token file: {e}")))?;
-        if !token.trim().is_empty() {
-            let value = http::HeaderValue::from_str(token.trim())
-                .map_err(|_| Error::invalid_config("invalid container authorization token"))?;
-            headers.insert(http::header::AUTHORIZATION, value);
-        }
+        let value = container_authorization_header_value(
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            &token,
+            true,
+        )?;
+        headers.insert(http::header::AUTHORIZATION, value);
     }
     Ok(headers)
 }
@@ -298,12 +335,11 @@ pub(crate) fn load_blocking(tls_root_store: TlsRootStore) -> Result<CredentialsS
 
     let client = metadata_blocking_client(Duration::from_secs(2), tls_root_store)?;
 
-    if let Some(full) = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
-        .ok()
-        .filter(|v| !v.is_empty())
+    if let Some(full) =
+        crate::util::env::optional_non_empty_var("AWS_CONTAINER_CREDENTIALS_FULL_URI")?
     {
         let full = parse_container_credentials_full_uri(&full)?;
-        let headers = container_auth_headers_blocking()?;
+        let headers = container_auth_headers()?;
         let body = http_get_text_blocking(&client, full.as_str(), &headers)?;
         let parsed: MetadataCredentials = serde_json::from_str(&body).map_err(|e| {
             Error::decode(
@@ -314,13 +350,12 @@ pub(crate) fn load_blocking(tls_root_store: TlsRootStore) -> Result<CredentialsS
         return parsed.into_snapshot();
     }
 
-    if let Some(rel) = std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
-        .ok()
-        .filter(|v| !v.is_empty())
+    if let Some(rel) =
+        crate::util::env::optional_non_empty_var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")?
     {
         let rel = parse_container_credentials_relative_uri(&rel)?;
         let url = format!("http://169.254.170.2{rel}");
-        let headers = container_auth_headers_blocking()?;
+        let headers = container_auth_headers()?;
         let body = http_get_text_blocking(&client, &url, &headers)?;
         let parsed: MetadataCredentials = serde_json::from_str(&body).map_err(|e| {
             Error::decode(
@@ -333,10 +368,12 @@ pub(crate) fn load_blocking(tls_root_store: TlsRootStore) -> Result<CredentialsS
 
     let token = match fetch_imds_v2_token_blocking(&client) {
         Ok(token) => Some(token),
-        Err(err)
-            if imds_v1_fallback_allowed() && should_fallback_to_imds_v1_from_token_error(&err) =>
-        {
-            None
+        Err(err) if should_fallback_to_imds_v1_from_token_error(&err) => {
+            if imds_v1_fallback_allowed()? {
+                None
+            } else {
+                return Err(err);
+            }
         }
         Err(err) => return Err(err),
     };
@@ -352,10 +389,8 @@ pub(crate) fn load_blocking(tls_root_store: TlsRootStore) -> Result<CredentialsS
         "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
         &headers,
     )?;
-    let role = role.lines().next().unwrap_or("").trim();
-    if role.is_empty() {
-        return Err(Error::invalid_config("missing IMDS role name"));
-    }
+    let role = imds_role_name_from_body(&role)?;
+    let role = crate::util::encode::aws_percent_encode(&role);
 
     let url = format!("http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}");
     let body = http_get_text_blocking(&client, &url, &headers)?;
@@ -382,16 +417,15 @@ fn http_get_text_blocking(
         .send()
         .map_err(|e| crate::transport::map_reqx_error("request failed", e))?;
     let status = resp.status();
-    let out = String::from_utf8_lossy(resp.body()).to_string();
 
     if status.is_success() {
-        return Ok(out);
+        return crate::util::text::decode_utf8_response_body(resp.body());
     }
 
-    Err(crate::transport::response_error_from_status(
+    Err(crate::transport::response_error_from_body(
         status,
         resp.headers(),
-        &out,
+        resp.body(),
     ))
 }
 
@@ -412,38 +446,72 @@ fn fetch_imds_v2_token_blocking(client: &reqx::blocking::Client) -> Result<Strin
         .map_err(|e| crate::transport::map_reqx_error("request failed", e))?;
 
     let status = resp.status();
-    let out = String::from_utf8_lossy(resp.body()).to_string();
 
     if status.is_success() {
-        return Ok(out.trim().to_string());
+        return imds_token_from_body(resp.body());
     }
 
-    Err(crate::transport::response_error_from_status(
+    Err(crate::transport::response_error_from_body(
         status,
         resp.headers(),
-        &out,
+        resp.body(),
     ))
 }
 
-#[cfg(feature = "blocking")]
-fn container_auth_headers_blocking() -> Result<http::HeaderMap, Error> {
-    let mut headers = http::HeaderMap::new();
-    if let Ok(token) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN") {
-        if !token.trim().is_empty() {
-            let value = http::HeaderValue::from_str(token.trim())
-                .map_err(|_| Error::invalid_config("invalid container authorization token"))?;
-            headers.insert(http::header::AUTHORIZATION, value);
-        }
-    } else if let Ok(path) = std::env::var("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") {
-        let token = std::fs::read_to_string(path)
-            .map_err(|e| Error::invalid_config(format!("failed to read token file: {e}")))?;
-        if !token.trim().is_empty() {
-            let value = http::HeaderValue::from_str(token.trim())
-                .map_err(|_| Error::invalid_config("invalid container authorization token"))?;
-            headers.insert(http::header::AUTHORIZATION, value);
-        }
+fn imds_token_from_body(body: &bytes::Bytes) -> Result<String, Error> {
+    let token = crate::util::text::decode_single_line_response_body("IMDSv2 token", body)?;
+    if token.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(Error::decode(
+            "IMDSv2 token response must not contain ASCII whitespace",
+            None,
+        ));
     }
-    Ok(headers)
+    http::HeaderValue::from_str(&token)
+        .map_err(|_| Error::decode("IMDSv2 token response is not a valid header value", None))?;
+    Ok(token)
+}
+
+fn imds_role_name_from_body(body: &str) -> Result<String, Error> {
+    let role = crate::util::text::strip_trailing_line_ending(body);
+    if role.is_empty() {
+        return Err(Error::decode("missing IMDS role name", None));
+    }
+    if role.len() > 64
+        || !role.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'=' | b',' | b'.' | b'@' | b'-')
+        })
+    {
+        return Err(Error::decode("invalid IMDS role name", None));
+    }
+    Ok(role.to_string())
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+fn container_authorization_header_value(
+    source: &'static str,
+    raw: &str,
+    strip_file_line_ending: bool,
+) -> Result<http::HeaderValue, Error> {
+    let token = if strip_file_line_ending {
+        crate::util::text::strip_trailing_line_ending(raw)
+    } else {
+        raw
+    };
+    if token.is_empty() {
+        return Err(Error::invalid_config(format!("{source} must not be empty")));
+    }
+    if token.trim() != token {
+        return Err(Error::invalid_config(format!(
+            "{source} must not include leading or trailing whitespace"
+        )));
+    }
+    if token.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::invalid_config(format!(
+            "{source} must not contain ASCII control characters"
+        )));
+    }
+    http::HeaderValue::from_str(token)
+        .map_err(|_| Error::invalid_config("invalid container authorization token"))
 }
 
 #[cfg(feature = "async")]
@@ -489,6 +557,8 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::Duration;
     use std::time::Instant;
+
+    use bytes::Bytes;
 
     use super::*;
 
@@ -613,6 +683,23 @@ mod tests {
     }
 
     #[test]
+    fn metadata_credentials_rejects_ambiguous_expiration() {
+        let json = r#"
+{
+  "AccessKeyId": "AKIA_TEST",
+  "Expiration": " 2020-01-01T00:00:00Z",
+  "SecretAccessKey": "SECRET_TEST",
+  "Token": "TOKEN_TEST"
+}
+"#;
+        let parsed: MetadataCredentials = serde_json::from_str(json).unwrap();
+        let err = parsed
+            .into_snapshot()
+            .expect_err("ambiguous expiration must be rejected");
+        assert!(matches!(err, Error::Decode { .. }));
+    }
+
+    #[test]
     fn parse_container_credentials_full_uri_rejects_non_local_http_host() {
         let err = parse_container_credentials_full_uri("http://example.com/creds")
             .expect_err("non-local http host must be rejected");
@@ -641,6 +728,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_container_credentials_full_uri_rejects_ambiguous_parts() {
+        for uri in [
+            "http://user@127.0.0.1/creds",
+            "http://127.0.0.1/creds#fragment",
+            "http://127.0.0.1/cre ds",
+        ] {
+            let err = parse_container_credentials_full_uri(uri)
+                .expect_err("ambiguous full URI must be rejected");
+            match err {
+                Error::InvalidConfig { .. } => {}
+                other => panic!("expected invalid config, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parse_container_credentials_relative_uri_rejects_missing_leading_slash() {
         let err = parse_container_credentials_relative_uri("v2/credentials/abc")
             .expect_err("relative URI must start with slash");
@@ -663,10 +766,73 @@ mod tests {
     }
 
     #[test]
+    fn parse_container_credentials_relative_uri_rejects_ambiguous_values() {
+        for value in ["/v2/credentials/a bc", "/v2/credentials/abc#frag"] {
+            let err = parse_container_credentials_relative_uri(value)
+                .expect_err("ambiguous relative URI must be rejected");
+            match err {
+                Error::InvalidConfig { .. } => {}
+                other => panic!("expected invalid config, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parse_container_credentials_relative_uri_accepts_valid_path() {
         let parsed = parse_container_credentials_relative_uri("/v2/credentials/abc")
             .expect("valid relative URI should pass");
         assert_eq!(parsed, "/v2/credentials/abc");
+    }
+
+    #[test]
+    fn imds_token_from_body_rejects_empty_or_invalid_header_values() {
+        assert_eq!(
+            imds_token_from_body(&Bytes::from_static(b"token\n"))
+                .expect("line ending should be trimmed"),
+            "token"
+        );
+        assert!(imds_token_from_body(&Bytes::from_static(b"   ")).is_err());
+        assert!(imds_token_from_body(&Bytes::from_static(b"tok\nen")).is_err());
+        assert!(imds_token_from_body(&Bytes::from_static(b"token\n\n")).is_err());
+        assert!(imds_token_from_body(&Bytes::from_static(b"tok en")).is_err());
+    }
+
+    #[test]
+    fn imds_role_name_from_body_rejects_ambiguous_values() {
+        assert_eq!(
+            imds_role_name_from_body("demo-role\n").unwrap(),
+            "demo-role"
+        );
+        assert!(imds_role_name_from_body("").is_err());
+        assert!(imds_role_name_from_body("demo role").is_err());
+        assert!(imds_role_name_from_body("path/demo").is_err());
+        assert!(imds_role_name_from_body("demo\nignored").is_err());
+        assert!(imds_role_name_from_body(&"a".repeat(65)).is_err());
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn container_authorization_header_value_is_strict_about_boundaries() {
+        assert_eq!(
+            container_authorization_header_value("token", "Bearer abc", false)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer abc"
+        );
+        assert_eq!(
+            container_authorization_header_value("token_file", "Bearer abc\n", true)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer abc"
+        );
+        assert!(container_authorization_header_value("token", "", false).is_err());
+        assert!(container_authorization_header_value("token", " Bearer abc", false).is_err());
+        assert!(container_authorization_header_value("token", "Bearer abc\n", false).is_err());
+        assert!(
+            container_authorization_header_value("token_file", "Bearer abc\n\n", true).is_err()
+        );
     }
 
     #[test]

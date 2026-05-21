@@ -11,9 +11,11 @@ use crate::{
     error::{Error, Result},
     transport::{
         MAX_BUFFERED_RESPONSE_BODY_BYTES, RequestAttemptState, RequestTimer, RetryConfig,
-        ServiceErrorAction, TransportRequestBody, content_length_header_value, default_tls_backend,
-        ensure_method_accepts_body, map_reqx_error, prepare_user_agent, record_service_retry,
-        reqx_backoff_source, reqx_retry_policy, response_error_from_status, service_error_action,
+        ServiceErrorAction, TransportRequestBody, content_length_header_value,
+        content_length_header_value_from_len, default_tls_backend, ensure_method_accepts_body,
+        map_reqx_error, prepare_user_agent, record_service_retry, reqx_backoff_source,
+        reqx_retry_policy, response_error_from_status, service_error_action,
+        validate_request_timeout,
     },
 };
 
@@ -98,6 +100,8 @@ impl BlockingTransport {
         timeout: Option<Duration>,
         tls_root_store: TlsRootStore,
     ) -> Result<Self> {
+        let retry = retry.validate()?;
+        validate_request_timeout(timeout)?;
         let (user_agent_text, user_agent) = prepare_user_agent(user_agent)?;
 
         let mut builder = reqx::blocking::Client::builder("http://localhost")
@@ -155,7 +159,7 @@ impl BlockingTransport {
                 &method,
                 resp.status(),
                 resp.headers(),
-                &resp.text_lossy(),
+                resp.body(),
             ) {
                 match action {
                     ServiceErrorAction::RetryAfter(delay) => {
@@ -183,9 +187,36 @@ impl BlockingTransport {
         headers: HeaderMap,
         body: BlockingBody,
     ) -> Result<reqx::blocking::ResponseStream> {
-        let req = self.build_request(&method, url, headers, body)?;
-        req.send_response_stream()
-            .map_err(|err| map_reqx_error("request failed", err))
+        let mut attempts = RequestAttemptState::new(self.retry, body);
+        let max_attempts = attempts.max_attempts();
+        let timer = RequestTimer::start();
+
+        for attempt in 1..=max_attempts {
+            let current_body = attempts.next_body()?;
+            let req = self.build_request(&method, url.clone(), headers.clone(), current_body)?;
+            let resp = req
+                .send_response_stream()
+                .map_err(|err| map_reqx_error("request failed", err))?;
+
+            if let Some(ServiceErrorAction::RetryAfter(delay)) = service_error_action(
+                self.retry,
+                attempt,
+                max_attempts,
+                &method,
+                resp.status(),
+                resp.headers(),
+                b"",
+            ) {
+                record_service_retry(&method);
+                std::thread::sleep(delay);
+                continue;
+            }
+
+            timer.finish(&method);
+            return Ok(resp);
+        }
+
+        Err(Error::transport("request failed after retries", None))
     }
 
     fn build_request(
@@ -210,7 +241,12 @@ impl BlockingTransport {
 
         req = match body {
             BlockingBody::Empty => req,
-            BlockingBody::Bytes(b) => req.body(b),
+            BlockingBody::Bytes(b) => req
+                .header(
+                    http::header::CONTENT_LENGTH,
+                    content_length_header_value_from_len(b.len())?,
+                )
+                .body(b),
             BlockingBody::Reader {
                 reader,
                 content_length: Some(len),
@@ -238,8 +274,8 @@ pub(crate) fn response_error(status: StatusCode, headers: &http::HeaderMap, body
 mod tests {
     use std::io::{ErrorKind, Read, Write};
     use std::net::{SocketAddr, TcpListener};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use super::*;
@@ -247,6 +283,8 @@ mod tests {
     mod reqx {
         pub use ::reqx::advanced::TlsRootStore;
     }
+
+    type RequestCaptureServer = (SocketAddr, std::thread::JoinHandle<()>, Arc<Mutex<Vec<u8>>>);
 
     fn spawn_test_server(
         responses: Vec<Vec<u8>>,
@@ -311,6 +349,96 @@ mod tests {
         });
 
         Ok((addr, handle, hits))
+    }
+
+    fn spawn_request_capture_server(response: Vec<u8>) -> Result<RequestCaptureServer> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| Error::transport("failed to bind test server", Some(Box::new(e))))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| Error::transport("failed to configure test server", Some(Box::new(e))))?;
+        let addr = listener.local_addr().map_err(|e| {
+            Error::transport("failed to read test server address", Some(Box::new(e)))
+        })?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_thread = captured.clone();
+
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = Vec::new();
+                        let mut buf = [0u8; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => request.extend_from_slice(&buf[..n]),
+                                Err(err)
+                                    if matches!(
+                                        err.kind(),
+                                        ErrorKind::WouldBlock | ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        *captured_thread.lock().expect("capture lock") = request;
+                        let _ = stream.write_all(&response);
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Ok((addr, handle, captured))
+    }
+
+    #[test]
+    fn send_bytes_sets_content_length() -> Result<()> {
+        let (addr, handle, captured) = spawn_request_capture_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )?;
+        let transport = BlockingTransport::new(
+            RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::default()
+            },
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::BackendDefault,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        transport.send(
+            Method::PUT,
+            url,
+            HeaderMap::new(),
+            BlockingBody::Bytes(Bytes::from_static(b"abc")),
+        )?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        let request = String::from_utf8(captured.lock().expect("capture lock").clone())
+            .map_err(|e| Error::decode("captured request is not valid UTF-8", Some(Box::new(e))))?;
+        let request = request.to_ascii_lowercase();
+        assert_eq!(request.matches("\r\ncontent-length: ").count(), 1);
+        assert!(request.contains("\r\ncontent-length: 3\r\n"));
+        Ok(())
     }
 
     #[test]
@@ -760,6 +888,43 @@ mod tests {
 
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert_eq!(resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[test]
+    fn send_stream_retries_retryable_status_for_replayable_body() -> Result<()> {
+        let (addr, handle, hits) = spawn_test_server(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        ])?;
+
+        let retry = RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(0),
+            max_delay: Duration::from_millis(0),
+            max_retry_after: Duration::from_secs(30),
+        };
+        let transport = BlockingTransport::new(
+            retry,
+            None,
+            Some(Duration::from_secs(5)),
+            reqx::TlsRootStore::System,
+        )?;
+        let url = Url::parse(&format!("http://{addr}/"))
+            .map_err(|_| Error::invalid_config("invalid test server URL"))?;
+
+        let mut resp =
+            transport.send_stream(Method::GET, url, HeaderMap::new(), BlockingBody::Empty)?;
+        let mut body = Vec::new();
+        resp.read_to_end(&mut body)
+            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
+        handle
+            .join()
+            .map_err(|_| Error::transport("test server thread panicked", None))?;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body, b"ok");
         Ok(())
     }
 

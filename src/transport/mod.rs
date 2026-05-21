@@ -55,6 +55,23 @@ impl Default for RetryConfig {
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
+impl RetryConfig {
+    pub(crate) fn validate(self) -> crate::error::Result<Self> {
+        if self.max_attempts == 0 {
+            return Err(crate::error::Error::invalid_config(
+                "max_attempts must be >= 1",
+            ));
+        }
+        if self.base_delay > self.max_delay {
+            return Err(crate::error::Error::invalid_config(
+                "base_retry_delay must be <= max_retry_delay",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
 pub(crate) const MAX_BUFFERED_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[cfg(any(feature = "async", feature = "blocking"))]
@@ -145,6 +162,24 @@ pub(crate) fn content_length_header_value(
 ) -> crate::error::Result<http::HeaderValue> {
     http::HeaderValue::from_str(&content_length.to_string())
         .map_err(|_| crate::error::Error::invalid_config("invalid Content-Length header"))
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn content_length_header_value_from_len(
+    content_length: usize,
+) -> crate::error::Result<http::HeaderValue> {
+    let content_length = u64::try_from(content_length).map_err(|_| {
+        crate::error::Error::invalid_config("Content-Length exceeds supported range")
+    })?;
+    content_length_header_value(content_length)
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn validate_request_timeout(timeout: Option<Duration>) -> crate::error::Result<()> {
+    if timeout.is_some_and(|timeout| timeout.is_zero()) {
+        return Err(crate::error::Error::invalid_config("timeout must be > 0"));
+    }
+    Ok(())
 }
 
 pub(crate) fn backoff_delay(config: RetryConfig, attempt: u32) -> Duration {
@@ -482,6 +517,18 @@ pub(crate) fn response_error_from_status(
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
+pub(crate) fn response_error_from_body(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> crate::error::Error {
+    match crate::util::text::decode_utf8_response_body(body) {
+        Ok(body) => response_error_from_status(status, headers, &body),
+        Err(err) => err,
+    }
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
 fn response_error_from_parts(
     status: http::StatusCode,
     headers: &http::HeaderMap,
@@ -553,9 +600,11 @@ pub(crate) fn service_error_action(
     method: &Method,
     status: http::StatusCode,
     headers: &http::HeaderMap,
-    body: &str,
+    body: &[u8],
 ) -> Option<ServiceErrorAction> {
-    if let Some(err) = response_service_error(status, headers, body) {
+    if let Ok(body) = std::str::from_utf8(body)
+        && let Some(err) = response_service_error(status, headers, body)
+    {
         if attempt < max_attempts && err.is_retryable() {
             return Some(ServiceErrorAction::RetryAfter(retry_delay_from_response(
                 retry, attempt, status, headers,
@@ -1107,6 +1156,42 @@ mod tests {
 
     #[cfg(any(feature = "async", feature = "blocking"))]
     #[test]
+    fn retry_config_rejects_ambiguous_delay_window() {
+        let err = RetryConfig {
+            base_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(1),
+            ..RetryConfig::default()
+        }
+        .validate()
+        .expect_err("base delay must not exceed max delay");
+
+        match err {
+            crate::error::Error::InvalidConfig { message } => {
+                assert!(message.contains("base_retry_delay"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn validate_request_timeout_rejects_zero() {
+        let err = validate_request_timeout(Some(Duration::ZERO))
+            .expect_err("zero timeout must be rejected");
+
+        match err {
+            crate::error::Error::InvalidConfig { message } => {
+                assert!(message.contains("timeout"));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+
+        assert!(validate_request_timeout(Some(Duration::from_millis(1))).is_ok());
+        assert!(validate_request_timeout(None).is_ok());
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
     fn prepare_user_agent_rejects_blank_or_ambiguous_values() {
         assert!(prepare_user_agent(Some(String::new())).is_err());
         assert!(prepare_user_agent(Some(" s3-client".to_string())).is_err());
@@ -1322,6 +1407,21 @@ mod tests {
 
     #[cfg(any(feature = "async", feature = "blocking"))]
     #[test]
+    fn response_error_from_body_rejects_invalid_utf8() {
+        let err = response_error_from_body(
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            &http::HeaderMap::new(),
+            &[0xff],
+        );
+
+        match err {
+            crate::error::Error::Decode { message, .. } => assert!(message.contains("UTF-8")),
+            other => panic!("expected Decode error, got {other:?}"),
+        }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
     fn response_error_from_status_uses_header_request_and_host_ids() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -1531,6 +1631,27 @@ mod tests {
 
     #[cfg(any(feature = "async", feature = "blocking"))]
     #[test]
+    fn response_service_error_ignores_delete_result_entry_errors() {
+        let body = r#"
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Deleted>
+    <Key>a</Key>
+  </Deleted>
+  <Error>
+    <Key>b</Key>
+    <Code>AccessDenied</Code>
+    <Message>Access Denied</Message>
+  </Error>
+</DeleteResult>
+"#;
+
+        assert!(
+            response_service_error(http::StatusCode::OK, &http::HeaderMap::new(), body).is_none()
+        );
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
     fn response_service_error_maps_request_id_only_error_payload() {
         let body = r#"<Error><RequestId>req-only</RequestId></Error>"#;
         let err =
@@ -1561,6 +1682,41 @@ mod tests {
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
+    }
+
+    #[cfg(any(feature = "async", feature = "blocking"))]
+    #[test]
+    fn service_error_action_ignores_invalid_utf8_for_embedded_error_detection() {
+        let retry = RetryConfig {
+            max_attempts: 2,
+            ..RetryConfig::default()
+        };
+
+        assert!(
+            service_error_action(
+                retry,
+                1,
+                2,
+                &Method::GET,
+                http::StatusCode::OK,
+                &http::HeaderMap::new(),
+                &[0xff],
+            )
+            .is_none()
+        );
+
+        assert!(matches!(
+            service_error_action(
+                retry,
+                1,
+                2,
+                &Method::GET,
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                &http::HeaderMap::new(),
+                &[0xff],
+            ),
+            Some(ServiceErrorAction::RetryAfter(_))
+        ));
     }
 
     #[cfg(all(

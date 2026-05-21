@@ -1,24 +1,28 @@
 //! Async object operations.
 
-use std::{io, time::Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_core::Stream;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 
+#[cfg(test)]
+use super::common::parse_xml_or_service_error;
 use super::common::{
-    ByteRange, apply_metadata_headers, insert_header, insert_optional_header,
-    parse_xml_or_service_error, validate_max_keys,
+    ByteRange, apply_copy_metadata_headers, apply_metadata_headers, insert_header,
+    insert_optional_header, parse_async_xml_response, validate_content_length_matches_body,
+    validate_max_keys, validate_query_token, validate_query_value,
 };
 #[cfg(feature = "multipart")]
 use super::common::{
-    prepare_completed_parts, validate_max_parts, validate_upload_id, validate_upload_part_number,
+    prepare_completed_parts, validate_max_parts, validate_part_number_marker, validate_upload_id,
+    validate_upload_part_number,
 };
 
 use crate::{
     client::Client,
     error::{Error, Result},
-    transport::async_transport::{AsyncBody, response_error},
+    transport::async_transport::{AsyncBody, boxed_byte_stream, response_error},
     types::{
         CopyObjectOutput, DeleteObjectIdentifier, DeleteObjectOutput, DeleteObjectsOutput,
         GetObjectOutput, HeadObjectOutput, ListObjectsV2Output, PresignedRequest, PutObjectOutput,
@@ -130,7 +134,7 @@ impl ObjectsService {
             source_version_id: None,
             destination_bucket: destination_bucket.into(),
             destination_key: destination_key.into(),
-            metadata_directive: None,
+            replace_metadata: false,
             metadata: Vec::new(),
             content_type: None,
         }
@@ -421,26 +425,30 @@ impl GetObjectRequest {
                 range.header_value("invalid Range header")?,
             );
         }
-        if let Some(value) = self.if_match {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid If-Match header"))?;
-            headers.insert(http::header::IF_MATCH, value);
-        }
-        if let Some(value) = self.if_none_match {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid If-None-Match header"))?;
-            headers.insert(http::header::IF_NONE_MATCH, value);
-        }
-        if let Some(value) = self.if_modified_since {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid If-Modified-Since header"))?;
-            headers.insert(http::header::IF_MODIFIED_SINCE, value);
-        }
-        if let Some(value) = self.if_unmodified_since {
-            let value = HeaderValue::from_str(&value)
-                .map_err(|_| Error::invalid_config("invalid If-Unmodified-Since header"))?;
-            headers.insert(http::header::IF_UNMODIFIED_SINCE, value);
-        }
+        insert_optional_header(
+            &mut headers,
+            http::header::IF_MATCH,
+            self.if_match,
+            "invalid If-Match header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::IF_NONE_MATCH,
+            self.if_none_match,
+            "invalid If-None-Match header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::IF_MODIFIED_SINCE,
+            self.if_modified_since,
+            "invalid If-Modified-Since header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::IF_UNMODIFIED_SINCE,
+            self.if_unmodified_since,
+            "invalid If-Unmodified-Since header",
+        )?;
 
         let resp = self
             .client
@@ -461,8 +469,7 @@ impl GetObjectRequest {
                 .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
             return Err(response_error(
                 crate::transport::async_transport::AsyncResponse::from_reqx(resp),
-            )
-            .await);
+            ));
         }
 
         let etag = crate::util::headers::header_string(resp.headers(), http::header::ETAG);
@@ -518,7 +525,7 @@ impl HeadObjectRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
         Ok(HeadObjectOutput {
@@ -641,21 +648,23 @@ impl PutObjectRequest {
     }
 
     /// Sets the request body from a byte stream.
-    pub fn body_stream<S>(mut self, stream: S) -> Self
+    pub fn body_stream<S, E>(mut self, stream: S) -> Self
     where
-        S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + Sync + 'static,
+        S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.body = AsyncBody::Stream {
-            stream: Box::pin(stream),
+            stream: boxed_byte_stream(stream),
             content_length: None,
         };
         self
     }
 
     /// Sets a streaming body with a known content length.
-    pub fn body_stream_sized<S>(mut self, stream: S, content_length: u64) -> Self
+    pub fn body_stream_sized<S, E>(mut self, stream: S, content_length: u64) -> Self
     where
-        S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + Sync + 'static,
+        S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.content_length = Some(content_length);
         self.body_stream(stream)
@@ -709,20 +718,27 @@ impl PutObjectRequest {
         }
 
         let body = match self.body {
+            AsyncBody::Empty => {
+                validate_content_length_matches_body(self.content_length, 0, "put_object")?;
+                AsyncBody::Bytes(Bytes::new())
+            }
+            AsyncBody::Bytes(bytes) => {
+                validate_content_length_matches_body(
+                    self.content_length,
+                    bytes.len(),
+                    "put_object",
+                )?;
+                AsyncBody::Bytes(bytes)
+            }
             AsyncBody::Stream { stream, .. } => {
                 let content_length = self.content_length.ok_or_else(|| {
                     Error::invalid_config("streaming put requires content_length")
                 })?;
-                headers.insert(
-                    http::header::CONTENT_LENGTH,
-                    crate::transport::content_length_header_value(content_length)?,
-                );
                 AsyncBody::Stream {
                     stream,
                     content_length: Some(content_length),
                 }
             }
-            other => other,
         };
 
         let resp = self
@@ -738,7 +754,7 @@ impl PutObjectRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
         Ok(PutObjectOutput {
@@ -773,7 +789,7 @@ impl DeleteObjectRequest {
             return Ok(DeleteObjectOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -847,14 +863,10 @@ impl DeleteObjectsRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_delete_objects(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_delete_objects)
     }
 }
 
@@ -866,7 +878,7 @@ pub struct CopyObjectRequest {
     source_version_id: Option<String>,
     destination_bucket: String,
     destination_key: String,
-    metadata_directive: Option<MetadataDirective>,
+    replace_metadata: bool,
     metadata: Vec<(String, String)>,
     content_type: Option<String>,
 }
@@ -880,7 +892,7 @@ impl CopyObjectRequest {
 
     /// Replaces metadata on the destination object.
     pub fn replace_metadata(mut self) -> Self {
-        self.metadata_directive = Some(MetadataDirective::Replace);
+        self.replace_metadata = true;
         self
     }
 
@@ -912,21 +924,12 @@ impl CopyObjectRequest {
             "invalid x-amz-copy-source header",
         )?;
 
-        if matches!(self.metadata_directive, Some(MetadataDirective::Replace)) {
-            headers.insert(
-                "x-amz-metadata-directive",
-                HeaderValue::from_static("REPLACE"),
-            );
-        }
-
-        insert_optional_header(
+        apply_copy_metadata_headers(
             &mut headers,
-            http::header::CONTENT_TYPE,
+            self.replace_metadata,
             self.content_type,
-            "invalid Content-Type header",
+            self.metadata,
         )?;
-
-        apply_metadata_headers(&mut headers, self.metadata)?;
 
         let resp = self
             .client
@@ -941,24 +944,11 @@ impl CopyObjectRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let status = resp.status();
-        let response_headers = resp.headers().clone();
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
-            crate::util::xml::parse_copy_object(body)
-        })
+        parse_async_xml_response(resp, crate::util::xml::parse_copy_object)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetadataDirective {
-    Replace,
 }
 
 #[cfg(feature = "multipart")]
@@ -1010,18 +1000,10 @@ impl CreateMultipartUploadRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let status = resp.status();
-        let response_headers = resp.headers().clone();
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
-            crate::util::xml::parse_create_multipart_upload(body)
-        })
+        parse_async_xml_response(resp, crate::util::xml::parse_create_multipart_upload)
     }
 }
 
@@ -1045,12 +1027,13 @@ impl UploadPartRequest {
     }
 
     /// Sets a streaming request body with a known content length.
-    pub fn body_stream_sized<S>(mut self, stream: S, content_length: u64) -> Self
+    pub fn body_stream_sized<S, E>(mut self, stream: S, content_length: u64) -> Self
     where
-        S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + Sync + 'static,
+        S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.body = AsyncBody::Stream {
-            stream: Box::pin(stream),
+            stream: boxed_byte_stream(stream),
             content_length: Some(content_length),
         };
         self
@@ -1080,7 +1063,7 @@ impl UploadPartRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
         Ok(UploadPartOutput {
@@ -1184,18 +1167,10 @@ impl UploadPartCopyRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let status = resp.status();
-        let response_headers = resp.headers().clone();
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
-            crate::util::xml::parse_upload_part_copy(body)
-        })
+        parse_async_xml_response(resp, crate::util::xml::parse_upload_part_copy)
     }
 }
 
@@ -1253,18 +1228,10 @@ impl CompleteMultipartUploadRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let status = resp.status();
-        let response_headers = resp.headers().clone();
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
-            crate::util::xml::parse_complete_multipart_upload(body)
-        })
+        parse_async_xml_response(resp, crate::util::xml::parse_complete_multipart_upload)
     }
 }
 
@@ -1299,7 +1266,7 @@ impl AbortMultipartUploadRequest {
             return Ok(AbortMultipartUploadOutput);
         }
 
-        Err(response_error(resp).await)
+        Err(response_error(resp))
     }
 }
 
@@ -1338,6 +1305,7 @@ impl ListPartsRequest {
             query.push(("max-parts".to_string(), v.to_string()));
         }
         if let Some(v) = self.part_number_marker {
+            validate_part_number_marker(v)?;
             query.push(("part-number-marker".to_string(), v.to_string()));
         }
 
@@ -1354,18 +1322,10 @@ impl ListPartsRequest {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let status = resp.status();
-        let response_headers = resp.headers().clone();
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        parse_xml_or_service_error(status, &response_headers, &xml, |body| {
-            crate::util::xml::parse_list_parts(body)
-        })
+        parse_async_xml_response(resp, crate::util::xml::parse_list_parts)
     }
 }
 
@@ -1455,15 +1415,19 @@ impl ListObjectsV2Request {
         let mut query = Vec::new();
         query.push(("list-type".to_string(), "2".to_string()));
         if let Some(v) = self.prefix {
+            validate_query_value("prefix", &v)?;
             query.push(("prefix".to_string(), v));
         }
         if let Some(v) = self.delimiter {
+            validate_query_value("delimiter", &v)?;
             query.push(("delimiter".to_string(), v));
         }
         if let Some(v) = self.continuation_token {
+            validate_query_token("continuation_token", &v)?;
             query.push(("continuation-token".to_string(), v));
         }
         if let Some(v) = self.start_after {
+            crate::util::url::validate_object_key(&v)?;
             query.push(("start-after".to_string(), v));
         }
         if let Some(v) = self.max_keys {
@@ -1484,14 +1448,10 @@ impl ListObjectsV2Request {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(response_error(resp).await);
+            return Err(response_error(resp));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| Error::transport("failed to read response body", Some(Box::new(e))))?;
-        crate::util::xml::parse_list_objects_v2(&xml)
+        parse_async_xml_response(resp, crate::util::xml::parse_list_objects_v2)
     }
 }
 
@@ -1936,6 +1896,79 @@ mod tests {
         match err {
             Error::Decode { .. } => {}
             other => panic!("expected Decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_stream_accepts_send_non_sync_streams() {
+        use std::cell::Cell;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct NonSyncStream {
+            emitted: Cell<bool>,
+        }
+
+        #[derive(Debug)]
+        struct UploadStreamError;
+
+        impl std::fmt::Display for UploadStreamError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("upload stream error")
+            }
+        }
+
+        impl std::error::Error for UploadStreamError {}
+
+        impl Stream for NonSyncStream {
+            type Item = std::result::Result<Bytes, UploadStreamError>;
+
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                let this = self.get_mut();
+                if this.emitted.replace(true) {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(Bytes::from_static(b"x"))))
+                }
+            }
+        }
+
+        let client = Client::builder("https://s3.example.com")
+            .expect("builder should parse")
+            .region("us-east-1")
+            .auth(crate::Auth::Anonymous)
+            .build()
+            .expect("client should build");
+
+        let _request = client.objects().put("bucket", "key").body_stream_sized(
+            NonSyncStream {
+                emitted: Cell::new(false),
+            },
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn put_bytes_rejects_mismatched_content_length() {
+        let client = Client::builder("https://s3.example.com")
+            .expect("builder should parse")
+            .region("us-east-1")
+            .auth(crate::Auth::Anonymous)
+            .build()
+            .expect("client should build");
+
+        let err = client
+            .objects()
+            .put("bucket", "key")
+            .content_length(4)
+            .body_bytes("abc")
+            .send()
+            .await
+            .expect_err("mismatched byte body content length must fail before transport");
+
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("content_length")),
+            other => panic!("expected InvalidConfig, got {other:?}"),
         }
     }
 
