@@ -168,8 +168,8 @@ jobs:
       S3_TEST_STRICT: "0"
       S3_TEST_ENDPOINT: http://127.0.0.1:9000
       S3_TEST_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: rustfsadmin
-      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_ACCESS_KEY_ID: s3rsrustfsadmin
+      AWS_SECRET_ACCESS_KEY: s3rsrustfsadminsecret
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -184,8 +184,8 @@ jobs:
             -p 9000:9000 -p 9001:9001 \
             -v rustfs-data:/data \
             -e RUSTFS_ADDRESS=:9000 \
-            -e RUSTFS_ACCESS_KEY=rustfsadmin \
-            -e RUSTFS_SECRET_KEY=rustfsadmin \
+            -e RUSTFS_ACCESS_KEY=s3rsrustfsadmin \
+            -e RUSTFS_SECRET_KEY=s3rsrustfsadminsecret \
             -e RUSTFS_SERVER_DOMAINS=localhost \
             rustfs/rustfs:latest \
             /data
