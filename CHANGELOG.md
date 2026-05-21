@@ -1,8 +1,21 @@
+## [0.1.31] - 2026-05-21
+
+### 🚀 Features
+
+- [**breaking**] Harden S3 request validation and response handling
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.30] - 2026-05-19
 
 ### 🐛 Bug Fixes
 
 - Allow localhost virtual-hosted endpoints
+
+### ⚙️ Miscellaneous Tasks
+
+- Release s3 version 0.1.30
 ## [0.1.29] - 2026-05-19
 
 ### 🚀 Features
