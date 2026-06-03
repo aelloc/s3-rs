@@ -15,26 +15,42 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
         with:
-          toolchain: 1.95.0
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - run: cargo fmt --check
 
   feature-sanity:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
         with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - run: cargo check --lib --no-default-features
       - run: cargo test --lib --no-default-features
       - run: cargo test --lib --no-default-features --features providers
@@ -67,11 +83,17 @@ jobs:
               --features blocking,native-tls,multipart,checksums,credentials-profile,credentials-imds,credentials-sts,tracing,metrics
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
         with:
-          toolchain: 1.95.0
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - name: Install OpenSSL (native-tls)
         if: contains(matrix.name, 'native-tls')
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
@@ -105,10 +127,17 @@ jobs:
               --features blocking,native-tls,multipart,checksums,credentials-profile,credentials-imds,credentials-sts,tracing,metrics
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
         with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - name: Install OpenSSL (native-tls)
         if: contains(matrix.name, 'native-tls')
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
@@ -125,10 +154,17 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
         with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - name: Install OpenSSL (native-tls)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Start MinIO
@@ -172,10 +208,17 @@ jobs:
       AWS_SECRET_ACCESS_KEY: s3rsrustfsadminsecret
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
         with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
       - name: Install OpenSSL (native-tls)
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Start RustFS
