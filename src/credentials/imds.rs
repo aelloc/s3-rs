@@ -654,9 +654,9 @@ mod tests {
         let parsed: MetadataCredentials = serde_json::from_str(json).unwrap();
         let snapshot = parsed.into_snapshot().unwrap();
         let creds = snapshot.credentials();
-        assert_eq!(creds.access_key_id, "AKIA_TEST");
-        assert_eq!(creds.secret_access_key, "SECRET_TEST");
-        assert_eq!(creds.session_token.as_deref(), Some("TOKEN_TEST"));
+        assert_eq!(creds.access_key_id(), "AKIA_TEST");
+        assert_eq!(creds.secret_access_key(), "SECRET_TEST");
+        assert_eq!(creds.session_token(), Some("TOKEN_TEST"));
         assert_eq!(
             snapshot.expires_at(),
             Some(parse_expiration("2020-01-01T00:00:00Z").unwrap())
@@ -675,7 +675,7 @@ mod tests {
         let parsed: MetadataCredentials = serde_json::from_str(json).unwrap();
         let snapshot = parsed.into_snapshot().unwrap();
         let creds = snapshot.credentials();
-        assert!(creds.session_token.is_none());
+        assert!(creds.session_token().is_none());
         assert_eq!(
             snapshot.expires_at(),
             Some(parse_expiration("2020-01-01T00:00:00Z").unwrap())

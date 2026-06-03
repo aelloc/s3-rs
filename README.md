@@ -118,7 +118,7 @@ let buckets = client.buckets().list().send().await?;
 let objects = client
     .objects()
     .list_v2("my-bucket")
-    .prefix("logs/")
+    .prefix("logs/")?
     .send()
     .await?;
 

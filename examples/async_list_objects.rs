@@ -39,7 +39,7 @@ async fn main() -> Result<(), s3::Error> {
         .addressing_style(AddressingStyle::Auto)
         .build()?;
 
-    let mut pager = client.objects().list_v2(&bucket).max_keys(1000).pager();
+    let mut pager = client.objects().list_v2(&bucket).max_keys(1000)?.pager();
 
     let mut pages = 0u32;
     while let Some(page) = pager.next_page().await? {

@@ -76,20 +76,7 @@ fn validate_copy_source_bucket(bucket: &str) -> Result<()> {
 }
 
 pub(crate) fn validate_version_id(version_id: &str) -> Result<()> {
-    if version_id.is_empty() {
-        return Err(Error::invalid_config("version_id must not be empty"));
-    }
-    if version_id.trim() != version_id {
-        return Err(Error::invalid_config(
-            "version_id must not include leading or trailing whitespace",
-        ));
-    }
-    if version_id.bytes().any(|b| b.is_ascii_control()) {
-        return Err(Error::invalid_config(
-            "version_id must not contain ASCII control characters",
-        ));
-    }
-    Ok(())
+    crate::util::validation::validate_version_id(version_id)
 }
 
 #[cfg(test)]

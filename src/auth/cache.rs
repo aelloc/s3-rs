@@ -1,7 +1,7 @@
+#[cfg(feature = "blocking")]
+use std::sync::Condvar;
 #[cfg(any(feature = "async", feature = "blocking"))]
-use std::cfg_select;
-#[cfg(all(feature = "blocking", not(feature = "async")))]
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 #[cfg(any(feature = "async", feature = "blocking"))]
 use std::time::Duration;
 
@@ -33,24 +33,6 @@ enum RefreshDecision {
     },
 }
 
-#[cfg(any(feature = "async", feature = "blocking"))]
-cfg_select! {
-    feature = "async" => {
-        type CachedStateLock = tokio::sync::Mutex<CachedState>;
-    }
-    _ => {
-        type CachedStateLock = Mutex<CachedState>;
-    }
-}
-
-#[cfg(feature = "blocking")]
-enum BlockingRefreshWait {
-    #[cfg(all(feature = "blocking", not(feature = "async")))]
-    Condvar,
-    #[cfg(all(feature = "blocking", feature = "async"))]
-    Epoch(u64),
-}
-
 /// Cached credentials wrapper with refresh and throttling.
 ///
 /// This wrapper adds three behaviors to an underlying [`CredentialsProvider`]:
@@ -64,15 +46,11 @@ pub struct CachedProvider<P> {
     pub(super) inner: P,
     refresh_before: Duration,
     min_refresh_interval: Duration,
-    state: CachedStateLock,
-    #[cfg(all(feature = "blocking", not(feature = "async")))]
+    state: Mutex<CachedState>,
+    #[cfg(feature = "blocking")]
     condvar: Condvar,
     #[cfg(feature = "async")]
     notify: tokio::sync::Notify,
-    #[cfg(all(feature = "blocking", feature = "async"))]
-    refresh_epoch: std::sync::Mutex<u64>,
-    #[cfg(all(feature = "blocking", feature = "async"))]
-    refresh_condvar: std::sync::Condvar,
 }
 
 #[cfg(any(feature = "async", feature = "blocking"))]
@@ -86,19 +64,15 @@ where
             inner,
             refresh_before: Duration::from_secs(300),
             min_refresh_interval: Duration::from_secs(5),
-            state: CachedStateLock::new(CachedState {
+            state: Mutex::new(CachedState {
                 cached: None,
                 refreshing: false,
                 last_refresh_attempt: None,
             }),
-            #[cfg(all(feature = "blocking", not(feature = "async")))]
+            #[cfg(feature = "blocking")]
             condvar: Condvar::new(),
             #[cfg(feature = "async")]
             notify: tokio::sync::Notify::new(),
-            #[cfg(all(feature = "blocking", feature = "async"))]
-            refresh_epoch: std::sync::Mutex::new(0),
-            #[cfg(all(feature = "blocking", feature = "async"))]
-            refresh_condvar: std::sync::Condvar::new(),
         }
     }
 
@@ -116,18 +90,10 @@ where
 
     /// Seeds the cache with an initial snapshot.
     pub fn with_initial(mut self, snapshot: CredentialsSnapshot) -> Self {
-        cfg_select! {
-            feature = "async" => {
-                self.state.get_mut().cached = Some(snapshot);
-            }
-            _ => {
-                let state = self
-                    .state
-                    .get_mut()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.cached = Some(snapshot);
-            }
-        }
+        self.state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cached = Some(snapshot);
         self
     }
 
@@ -244,19 +210,22 @@ where
         refreshed: Result<CredentialsSnapshot>,
     ) -> Result<CredentialsSnapshot> {
         state.refreshing = false;
-        let fallback_now = OffsetDateTime::now_utc();
+        let now = OffsetDateTime::now_utc();
 
-        match refreshed {
-            Ok(snapshot) => {
+        let refresh_error = match refreshed {
+            Ok(snapshot) if !Self::is_expired(&snapshot, now) => {
                 state.cached = Some(snapshot.clone());
-                Ok(snapshot)
+                return Ok(snapshot);
             }
-            Err(_)
-                if let Some(snapshot) = fallback.filter(|s| !Self::is_expired(s, fallback_now)) =>
-            {
-                Ok(snapshot)
-            }
-            Err(err) => Err(err),
+            Ok(_) => Error::invalid_config("credentials are expired"),
+            Err(err) => err,
+        };
+
+        if let Some(snapshot) = fallback.filter(|s| !Self::is_expired(s, now)) {
+            Ok(snapshot)
+        } else {
+            state.cached = None;
+            Err(refresh_error)
         }
     }
 
@@ -264,91 +233,31 @@ where
         #[cfg(feature = "async")]
         self.notify.notify_waiters();
 
-        #[cfg(all(feature = "blocking", feature = "async"))]
-        self.notify_blocking_refresh_waiters();
-
-        #[cfg(all(feature = "blocking", not(feature = "async")))]
+        #[cfg(feature = "blocking")]
         self.condvar.notify_all();
     }
 
     #[cfg(feature = "blocking")]
     fn with_blocking_state<R>(&self, f: impl FnOnce(&mut CachedState) -> R) -> R {
-        cfg_select! {
-            all(feature = "blocking", not(feature = "async")) => {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                f(&mut state)
-            }
-            _ => {
-                let mut state = self.state.blocking_lock();
-                f(&mut state)
-            }
-        }
-    }
-
-    #[cfg(feature = "blocking")]
-    fn current_blocking_refresh_wait(&self) -> BlockingRefreshWait {
-        cfg_select! {
-            all(feature = "blocking", not(feature = "async")) => BlockingRefreshWait::Condvar,
-            _ => BlockingRefreshWait::Epoch(self.observed_refresh_epoch()),
-        }
-    }
-
-    #[cfg(feature = "blocking")]
-    fn wait_for_blocking_refresh(&self, wait: BlockingRefreshWait) {
-        cfg_select! {
-            all(feature = "blocking", not(feature = "async")) => {
-                let _ = wait;
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                while state.refreshing {
-                    state = self
-                        .condvar
-                        .wait(state)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-            }
-            _ => {
-                let BlockingRefreshWait::Epoch(observed_epoch) = wait;
-                self.wait_for_refresh_epoch_change(observed_epoch);
-            }
-        }
-    }
-
-    #[cfg(all(feature = "blocking", feature = "async"))]
-    fn observed_refresh_epoch(&self) -> u64 {
-        *self
-            .refresh_epoch
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[cfg(all(feature = "blocking", feature = "async"))]
-    fn wait_for_refresh_epoch_change(&self, observed_epoch: u64) {
-        let mut epoch = self
-            .refresh_epoch
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *epoch == observed_epoch {
-            epoch = self
-                .refresh_condvar
-                .wait(epoch)
+        f(&mut state)
+    }
+
+    #[cfg(feature = "blocking")]
+    fn wait_for_blocking_refresh(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.refreshing {
+            state = self
+                .condvar
+                .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-    }
-
-    #[cfg(all(feature = "blocking", feature = "async"))]
-    fn notify_blocking_refresh_waiters(&self) {
-        let mut epoch = self
-            .refresh_epoch
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *epoch = epoch.wrapping_add(1);
-        self.refresh_condvar.notify_all();
     }
 
     #[cfg(feature = "blocking")]
@@ -357,7 +266,7 @@ where
 
         enum BlockingDecision {
             UseCached(CredentialsSnapshot),
-            Wait(BlockingRefreshWait),
+            Wait,
             Refresh {
                 fallback: Option<CredentialsSnapshot>,
             },
@@ -370,9 +279,7 @@ where
                     Ok(RefreshDecision::UseCached(snapshot)) => {
                         Ok(BlockingDecision::UseCached(snapshot))
                     }
-                    Ok(RefreshDecision::Wait) => {
-                        Ok(BlockingDecision::Wait(self.current_blocking_refresh_wait()))
-                    }
+                    Ok(RefreshDecision::Wait) => Ok(BlockingDecision::Wait),
                     Ok(RefreshDecision::Refresh { fallback }) => {
                         Ok(BlockingDecision::Refresh { fallback })
                     }
@@ -382,8 +289,8 @@ where
 
             match decision {
                 BlockingDecision::UseCached(snapshot) => return Ok(snapshot),
-                BlockingDecision::Wait(wait) => {
-                    self.wait_for_blocking_refresh(wait);
+                BlockingDecision::Wait => {
+                    self.wait_for_blocking_refresh();
                     continue;
                 }
                 BlockingDecision::Refresh { fallback } => {
@@ -406,7 +313,10 @@ where
             let now_utc = OffsetDateTime::now_utc();
             let mut fallback = None;
             let notified = {
-                let mut state = self.state.lock().await;
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 match self.begin_refresh(&mut state, now_utc, Instant::now(), force)? {
                     RefreshDecision::UseCached(snapshot) => return Ok(snapshot),
@@ -427,9 +337,13 @@ where
 
             let refreshed = self.inner.credentials_async().await;
 
-            let mut state = self.state.lock().await;
-            let result = Self::finish_refresh_state(&mut state, fallback, refreshed);
-            drop(state);
+            let result = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::finish_refresh_state(&mut state, fallback, refreshed)
+            };
             self.notify_refresh_waiters();
             return result;
         }

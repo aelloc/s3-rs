@@ -51,7 +51,7 @@ async fn main() -> Result<(), s3::Error> {
     client
         .objects()
         .put(&bucket, &key)
-        .content_type("text/plain")
+        .content_type("text/plain")?
         .body_bytes(body.clone())
         .send()
         .await?;

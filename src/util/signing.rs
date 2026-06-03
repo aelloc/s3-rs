@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use graviola::hashing::{Hash as _, Sha256, hmac::Hmac};
-use http::{HeaderMap, HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
@@ -114,7 +114,10 @@ pub(crate) fn sign_headers_with_service(
     let credential_scope = credential_scope(params.region, params.service, params.now);
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-        params.credentials.access_key_id, credential_scope, signed_headers, signature
+        params.credentials.access_key_id(),
+        credential_scope,
+        signed_headers,
+        signature
     );
 
     let value = HeaderValue::from_str(&authorization)
@@ -143,7 +146,11 @@ pub(crate) fn presign(
 
     let amz_date = amz_datetime(params.now);
     let credential_scope = credential_scope(params.region, params.service, params.now);
-    let credential = format!("{}/{}", params.credentials.access_key_id, credential_scope);
+    let credential = format!(
+        "{}/{}",
+        params.credentials.access_key_id(),
+        credential_scope
+    );
 
     let mut query_params = existing_query_params.to_vec();
     query_params.push((
@@ -156,8 +163,8 @@ pub(crate) fn presign(
 
     query_params.push(("X-Amz-SignedHeaders".to_string(), signed_headers.clone()));
 
-    if let Some(token) = &params.credentials.session_token {
-        query_params.push(("X-Amz-Security-Token".to_string(), token.clone()));
+    if let Some(token) = params.credentials.session_token() {
+        query_params.push(("X-Amz-Security-Token".to_string(), token.to_string()));
     }
 
     resolved.canonical_query_string = crate::util::encode::canonical_query_string(&query_params);
@@ -199,7 +206,7 @@ pub(crate) fn presign(
     })
 }
 
-fn validate_presign_expires(expires_in: std::time::Duration) -> Result<u64, Error> {
+pub(crate) fn validate_presign_expires(expires_in: std::time::Duration) -> Result<u64, Error> {
     const MAX_PRESIGN_EXPIRES: std::time::Duration = std::time::Duration::from_secs(604_800);
 
     if expires_in.is_zero() {
@@ -223,10 +230,14 @@ fn validate_existing_presign_query_params(
     existing_query_params: &[(String, String)],
 ) -> Result<(), Error> {
     for (name, value) in existing_query_params {
-        validate_presign_query_name(name)?;
-        validate_presign_query_value(value)?;
+        validate_presign_query_param(name, value)?;
     }
     Ok(())
+}
+
+pub(crate) fn validate_presign_query_param(name: &str, value: &str) -> Result<(), Error> {
+    validate_presign_query_name(name)?;
+    validate_presign_query_value(value)
 }
 
 fn validate_presign_query_name(name: &str) -> Result<(), Error> {
@@ -270,12 +281,27 @@ fn validate_presign_query_value(value: &str) -> Result<(), Error> {
 }
 
 fn validate_presign_headers(headers: &HeaderMap) -> Result<(), Error> {
-    for name in headers.keys() {
-        if is_sigv4_managed_presign_header(name.as_str()) {
-            return Err(Error::invalid_config(format!(
-                "presign headers must not include SigV4-managed header {name}"
-            )));
-        }
+    for (name, value) in headers {
+        validate_presign_header(name, value)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_presign_header(name: &HeaderName, value: &HeaderValue) -> Result<(), Error> {
+    validate_presign_header_name(name)?;
+    value.to_str().map_err(|_| {
+        Error::invalid_config(format!(
+            "presign header {name} value must be representable as a UTF-8 string"
+        ))
+    })?;
+    Ok(())
+}
+
+pub(crate) fn validate_presign_header_name(name: &HeaderName) -> Result<(), Error> {
+    if is_sigv4_managed_presign_header(name.as_str()) {
+        return Err(Error::invalid_config(format!(
+            "presign headers must not include SigV4-managed header {name}"
+        )));
     }
     Ok(())
 }
@@ -302,7 +328,7 @@ fn set_amz_headers(
         .map_err(|_| Error::signing("invalid x-amz-content-sha256 header value"))?;
     headers.insert("x-amz-content-sha256", payload_hash);
 
-    if let Some(token) = &credentials.session_token {
+    if let Some(token) = credentials.session_token() {
         let token = HeaderValue::from_str(token)
             .map_err(|_| Error::signing("invalid x-amz-security-token header value"))?;
         headers.insert("x-amz-security-token", token);
@@ -427,7 +453,7 @@ fn signature(
     string_to_sign: &str,
 ) -> Result<String, Error> {
     let k_date = hmac_sha256(
-        format!("AWS4{}", credentials.secret_access_key).as_bytes(),
+        format!("AWS4{}", credentials.secret_access_key()).as_bytes(),
         date_stamp(now).as_bytes(),
     )?;
     let k_region = hmac_sha256(&k_date, region.as_str().as_bytes())?;
@@ -901,6 +927,40 @@ mod tests {
                 }
                 other => panic!("expected invalid config error, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn presign_rejects_non_utf8_header_values() {
+        let endpoint = url::Url::parse("https://example.com").unwrap();
+        let region = Region::new("us-east-1").unwrap();
+        let creds =
+            Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY").unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(1_369_353_600).unwrap();
+        let resolved = s3_url::resolve_url(
+            &endpoint,
+            Some("my-bucket"),
+            Some("a+b"),
+            &[],
+            AddressingStyle::Path,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-bin", HeaderValue::from_bytes(&[0xff]).unwrap());
+
+        let err = presign(
+            Method::GET,
+            resolved,
+            SigV4Params::for_s3(&region, &creds, now),
+            Duration::from_secs(60),
+            &[],
+            &headers,
+        )
+        .expect_err("non-UTF-8 signed header values must be rejected");
+
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("header")),
+            other => panic!("expected invalid config error, got {other:?}"),
         }
     }
 }

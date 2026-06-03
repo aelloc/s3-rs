@@ -23,6 +23,7 @@ pub(crate) fn sign_with_snapshot(
     snapshot: &CredentialsSnapshot,
     now: OffsetDateTime,
 ) -> Result<()> {
+    validate_credentials_snapshot(snapshot, now)?;
     util::signing::sign_headers(
         method,
         resolved,
@@ -32,6 +33,19 @@ pub(crate) fn sign_with_snapshot(
         snapshot.credentials(),
         now,
     )
+}
+
+pub(crate) fn validate_credentials_snapshot(
+    snapshot: &CredentialsSnapshot,
+    now: OffsetDateTime,
+) -> Result<()> {
+    if snapshot
+        .expires_at()
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(Error::invalid_config("credentials are expired"));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_endpoint(endpoint: &str) -> Result<Url> {
@@ -83,10 +97,8 @@ pub(crate) fn validate_presign_credentials_lifetime(
     expires_in: Duration,
     now: OffsetDateTime,
 ) -> Result<()> {
+    validate_credentials_snapshot(snapshot, now)?;
     if let Some(expires_at) = snapshot.expires_at() {
-        if expires_at <= now {
-            return Err(Error::invalid_config("credentials are expired"));
-        }
         let remaining: std::time::Duration = (expires_at - now).try_into().map_err(|_| {
             Error::invalid_config("failed to calculate credentials expiration window")
         })?;
@@ -110,6 +122,7 @@ mod tests {
         let snapshot = CredentialsSnapshot::new(
             Credentials::new("AKIA_TEST", "SECRET_TEST").expect("valid credentials"),
         );
+        assert!(validate_credentials_snapshot(&snapshot, OffsetDateTime::now_utc()).is_ok());
         assert!(
             validate_presign_credentials_lifetime(
                 &snapshot,
@@ -128,6 +141,13 @@ mod tests {
         )
         .with_expires_at(now - time::Duration::seconds(1));
         let err = validate_presign_credentials_lifetime(&snapshot, Duration::from_secs(1), now)
+            .expect_err("expired snapshot should be rejected");
+        match err {
+            Error::InvalidConfig { message } => assert!(message.contains("expired")),
+            other => panic!("expected invalid config, got {other:?}"),
+        }
+
+        let err = validate_credentials_snapshot(&snapshot, now)
             .expect_err("expired snapshot should be rejected");
         match err {
             Error::InvalidConfig { message } => assert!(message.contains("expired")),

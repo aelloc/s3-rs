@@ -7,7 +7,6 @@ use crate::{
 };
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
-const MAX_DELETE_OBJECTS: usize = 1_000;
 
 pub(crate) fn parse_error_xml(body: &str) -> Option<xml::XmlError> {
     if body.trim().is_empty() {
@@ -434,8 +433,8 @@ pub(crate) fn encode_complete_multipart_upload(
         parts: parts
             .iter()
             .map(|p| XmlPart {
-                part_number: p.part_number,
-                etag: &p.etag,
+                part_number: p.part_number(),
+                etag: p.etag(),
             })
             .collect(),
     })
@@ -458,18 +457,11 @@ pub(crate) fn encode_delete_objects(
             "delete_objects requires at least one object",
         ));
     }
-    if objects.len() > MAX_DELETE_OBJECTS {
+    if objects.len() > types::MAX_DELETE_OBJECTS_PER_REQUEST {
         return Err(Error::invalid_config(
             "delete_objects supports at most 1000 objects per request",
         ));
     }
-    for object in objects {
-        crate::util::url::validate_object_key(&object.key)?;
-        if let Some(version_id) = object.version_id.as_deref() {
-            crate::util::headers::validate_version_id(version_id)?;
-        }
-    }
-
     #[derive(serde::Serialize)]
     #[serde(rename = "Delete")]
     struct XmlOut<'a> {
@@ -494,8 +486,8 @@ pub(crate) fn encode_delete_objects(
         objects: objects
             .iter()
             .map(|o| XmlObject {
-                key: &o.key,
-                version_id: o.version_id.as_deref(),
+                key: o.key(),
+                version_id: o.version_id(),
             })
             .collect(),
         quiet,
@@ -508,11 +500,7 @@ pub(crate) fn encode_delete_objects(
 pub(crate) fn encode_bucket_versioning(
     configuration: &types::BucketVersioningConfiguration,
 ) -> Result<Bytes, Error> {
-    if configuration.status.is_none() {
-        return Err(Error::invalid_config(
-            "bucket versioning configuration must include status",
-        ));
-    }
+    validate_bucket_versioning(configuration)?;
 
     #[derive(serde::Serialize)]
     #[serde(rename = "VersioningConfiguration")]
@@ -537,6 +525,17 @@ pub(crate) fn encode_bucket_versioning(
         )
     })?;
     Ok(Bytes::from(xml))
+}
+
+pub(crate) fn validate_bucket_versioning(
+    configuration: &types::BucketVersioningConfiguration,
+) -> Result<(), Error> {
+    if configuration.status.is_none() {
+        return Err(Error::invalid_config(
+            "bucket versioning configuration must include status",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_bucket_lifecycle(
@@ -850,7 +849,7 @@ fn required_public_access_block_field(value: Option<bool>, field: &str) -> Resul
     })
 }
 
-fn validate_bucket_lifecycle(
+pub(crate) fn validate_bucket_lifecycle(
     configuration: &types::BucketLifecycleConfiguration,
 ) -> Result<(), Error> {
     if configuration.rules.is_empty() {
@@ -916,7 +915,9 @@ fn validate_lifecycle_expiration_date(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_bucket_cors(configuration: &types::BucketCorsConfiguration) -> Result<(), Error> {
+pub(crate) fn validate_bucket_cors(
+    configuration: &types::BucketCorsConfiguration,
+) -> Result<(), Error> {
     if configuration.rules.is_empty() {
         return Err(Error::invalid_config(
             "bucket cors configuration must include at least one rule",
@@ -1053,7 +1054,7 @@ fn validate_cors_expose_header(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_bucket_tagging(tagging: &types::BucketTagging) -> Result<(), Error> {
+pub(crate) fn validate_bucket_tagging(tagging: &types::BucketTagging) -> Result<(), Error> {
     if tagging.tags.len() > 50 {
         return Err(Error::invalid_config(
             "bucket tagging supports at most 50 tags",
@@ -1062,9 +1063,9 @@ fn validate_bucket_tagging(tagging: &types::BucketTagging) -> Result<(), Error> 
 
     let mut keys = std::collections::BTreeSet::new();
     for tag in &tagging.tags {
-        if tag.key.trim().is_empty() {
-            return Err(Error::invalid_config("bucket tag key must not be empty"));
-        }
+        validate_bucket_tag_key(&tag.key)?;
+        validate_bucket_tag_value(&tag.value)?;
+
         if !keys.insert(tag.key.as_str()) {
             return Err(Error::invalid_config("bucket tag keys must be unique"));
         }
@@ -1083,7 +1084,35 @@ fn validate_bucket_tagging(tagging: &types::BucketTagging) -> Result<(), Error> 
     Ok(())
 }
 
-fn validate_bucket_encryption(
+fn validate_bucket_tag_key(value: &str) -> Result<(), Error> {
+    validate_non_empty_trimmed_field(
+        value,
+        "bucket tag key must not be empty",
+        "bucket tag key must not include leading or trailing whitespace",
+    )?;
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::invalid_config(
+            "bucket tag key must not contain ASCII control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bucket_tag_value(value: &str) -> Result<(), Error> {
+    if value.trim() != value {
+        return Err(Error::invalid_config(
+            "bucket tag value must not include leading or trailing whitespace",
+        ));
+    }
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::invalid_config(
+            "bucket tag value must not contain ASCII control characters",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_bucket_encryption(
     configuration: &types::BucketEncryptionConfiguration,
 ) -> Result<(), Error> {
     if configuration.rules.is_empty() {
@@ -1581,8 +1610,11 @@ mod tests {
     #[test]
     fn encodes_delete_objects_request() {
         let objects = vec![
-            DeleteObjectIdentifier::new("a.txt"),
-            DeleteObjectIdentifier::new("b.txt").with_version_id("v1"),
+            DeleteObjectIdentifier::new("a.txt").unwrap(),
+            DeleteObjectIdentifier::new("b.txt")
+                .unwrap()
+                .with_version_id("v1")
+                .unwrap(),
         ];
         let xml = encode_delete_objects(&objects, true).unwrap();
         let xml = encoded_xml_to_string(xml);
@@ -1596,9 +1628,10 @@ mod tests {
 
     #[test]
     fn encode_delete_objects_rejects_oversized_batches() {
-        let objects = (0..=MAX_DELETE_OBJECTS)
+        let objects = (0..=types::MAX_DELETE_OBJECTS_PER_REQUEST)
             .map(|idx| DeleteObjectIdentifier::new(format!("key-{idx}")))
-            .collect::<Vec<_>>();
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
 
         let err = encode_delete_objects(&objects, false)
             .expect_err("delete_objects must reject batches over 1000 objects");
@@ -1610,21 +1643,14 @@ mod tests {
     }
 
     #[test]
-    fn encode_delete_objects_rejects_invalid_version_id() {
-        let objects = [DeleteObjectIdentifier::new("key").with_version_id(" version")];
-
-        assert_invalid_config(encode_delete_objects(&objects, false), "version_id");
-    }
-
-    #[test]
-    fn encode_delete_objects_rejects_invalid_keys() {
+    fn delete_object_identifier_rejects_invalid_values() {
+        assert_invalid_config(DeleteObjectIdentifier::new(""), "object key");
+        assert_invalid_config(DeleteObjectIdentifier::new("a/../b"), "path segments");
         assert_invalid_config(
-            encode_delete_objects(&[DeleteObjectIdentifier::new("")], false),
-            "object key",
-        );
-        assert_invalid_config(
-            encode_delete_objects(&[DeleteObjectIdentifier::new("a/../b")], false),
-            "path segments",
+            DeleteObjectIdentifier::new("key")
+                .unwrap()
+                .with_version_id(" version"),
+            "version_id",
         );
     }
 
@@ -1891,6 +1917,22 @@ mod tests {
         assert_invalid_config(encode_bucket_tagging(&cfg), "tag key");
 
         let cfg = types::BucketTagging {
+            tags: vec![types::Tag {
+                key: "key\u{7f}".to_string(),
+                value: "v".to_string(),
+            }],
+        };
+        assert_invalid_config(encode_bucket_tagging(&cfg), "control");
+
+        let cfg = types::BucketTagging {
+            tags: vec![types::Tag {
+                key: "k".to_string(),
+                value: " v".to_string(),
+            }],
+        };
+        assert_invalid_config(encode_bucket_tagging(&cfg), "tag value");
+
+        let cfg = types::BucketTagging {
             tags: (0..51)
                 .map(|idx| types::Tag {
                     key: format!("k-{idx}"),
@@ -1993,14 +2035,8 @@ mod tests {
     #[test]
     fn encodes_complete_multipart_upload() {
         let parts = vec![
-            types::CompletedPart {
-                part_number: 1,
-                etag: "\"etag1\"".to_string(),
-            },
-            types::CompletedPart {
-                part_number: 2,
-                etag: "\"etag2\"".to_string(),
-            },
+            types::CompletedPart::new(1, "\"etag1\"").unwrap(),
+            types::CompletedPart::new(2, "\"etag2\"").unwrap(),
         ];
         let xml = encode_complete_multipart_upload(&parts).unwrap();
         let xml = encoded_xml_to_string(xml);

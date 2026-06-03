@@ -95,12 +95,9 @@ impl TryFrom<&str> for Region {
 /// Static access credentials with optional session token.
 #[derive(Clone)]
 pub struct Credentials {
-    /// Access key identifier.
-    pub access_key_id: String,
-    /// Secret access key.
-    pub secret_access_key: String,
-    /// Optional session token for temporary credentials.
-    pub session_token: Option<String>,
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
 }
 
 impl Credentials {
@@ -128,6 +125,21 @@ impl Credentials {
         validate_credential_field("session_token", &session_token)?;
         self.session_token = Some(session_token);
         Ok(self)
+    }
+
+    /// Returns the access key identifier.
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    /// Returns the secret access key.
+    pub fn secret_access_key(&self) -> &str {
+        &self.secret_access_key
+    }
+
+    /// Returns the optional session token.
+    pub fn session_token(&self) -> Option<&str> {
+        self.session_token.as_deref()
     }
 }
 

@@ -50,7 +50,7 @@ fn s3_compat_blocking_put_get_delete_roundtrip() -> Result<(), Error> {
         let range = client
             .objects()
             .get(&bucket, key)
-            .range_bytes(0, 3)
+            .range_bytes(0, 3)?
             .send()?
             .bytes()?;
         assert_eq!(range, Bytes::from_static(b"hell"));
@@ -87,8 +87,8 @@ fn s3_compat_blocking_put_get_delete_roundtrip() -> Result<(), Error> {
         let pager = client
             .objects()
             .list_v2(&bucket)
-            .prefix("a/")
-            .max_keys(2)
+            .prefix("a/")?
+            .max_keys(2)?
             .pager();
         for page in pager {
             let page = page?;
@@ -97,7 +97,7 @@ fn s3_compat_blocking_put_get_delete_roundtrip() -> Result<(), Error> {
         keys.sort();
         assert_eq!(keys, vec!["a/1.txt", "a/2.txt", "a/3.txt"]);
 
-        let out = client.objects().list_v2(&bucket).delimiter("/").send()?;
+        let out = client.objects().list_v2(&bucket).delimiter("/")?.send()?;
         assert!(out.common_prefixes.iter().any(|p| p == "a/"));
         assert!(out.common_prefixes.iter().any(|p| p == "b/"));
         assert!(out.contents.iter().any(|o| o.key == "root.txt"));
@@ -126,7 +126,7 @@ fn s3_compat_blocking_put_get_delete_roundtrip() -> Result<(), Error> {
             .delete_objects(&bucket)
             .objects([
                 key, copied, "a/1.txt", "a/2.txt", "a/3.txt", "b/1.txt", "root.txt",
-            ])
+            ])?
             .send()?;
         Ok(())
     })
@@ -203,7 +203,7 @@ fn s3_compat_blocking_get_range_and_conditions() -> Result<(), Error> {
         let put = client
             .objects()
             .put(&bucket, key)
-            .content_type("text/plain")
+            .content_type("text/plain")?
             .body_bytes(body.clone())
             .send()?;
         let etag = put
@@ -213,7 +213,7 @@ fn s3_compat_blocking_get_range_and_conditions() -> Result<(), Error> {
         let got = client
             .objects()
             .get(&bucket, key)
-            .range_bytes(0, 4)
+            .range_bytes(0, 4)?
             .send()?
             .bytes()?;
         assert_eq!(got, Bytes::from_static(b"hello"));
@@ -221,7 +221,7 @@ fn s3_compat_blocking_get_range_and_conditions() -> Result<(), Error> {
         let ok = client
             .objects()
             .get(&bucket, key)
-            .if_match(etag.clone())
+            .if_match(etag.clone())?
             .send()?
             .bytes()?;
         assert_eq!(ok, body);
@@ -230,7 +230,7 @@ fn s3_compat_blocking_get_range_and_conditions() -> Result<(), Error> {
         match client
             .objects()
             .get(&bucket, key)
-            .if_none_match(etag)
+            .if_none_match(etag)?
             .send()
         {
             Ok(out) => {
@@ -279,7 +279,7 @@ fn s3_compat_blocking_list_buckets_and_bucket_configs() -> Result<(), Error> {
         match client
             .buckets()
             .put_versioning(&bucket)
-            .configuration(versioning)
+            .configuration(versioning)?
             .send()
         {
             Ok(_) => match client.buckets().get_versioning(&bucket).send() {
@@ -300,7 +300,7 @@ fn s3_compat_blocking_list_buckets_and_bucket_configs() -> Result<(), Error> {
         match client
             .buckets()
             .put_tagging(&bucket)
-            .tagging(tagging)
+            .tagging(tagging)?
             .send()
         {
             Ok(_) => {
@@ -342,7 +342,7 @@ fn s3_compat_blocking_list_buckets_and_bucket_configs() -> Result<(), Error> {
         match client
             .buckets()
             .put_cors(&bucket)
-            .configuration(cors)
+            .configuration(cors)?
             .send()
         {
             Ok(_) => {
@@ -381,7 +381,7 @@ fn s3_compat_blocking_list_buckets_and_bucket_configs() -> Result<(), Error> {
         match client
             .buckets()
             .put_lifecycle(&bucket)
-            .configuration(lifecycle)
+            .configuration(lifecycle)?
             .send()
         {
             Ok(_) => {
@@ -421,7 +421,7 @@ fn s3_compat_blocking_list_buckets_and_bucket_configs() -> Result<(), Error> {
         match client
             .buckets()
             .put_encryption(&bucket)
-            .configuration(encryption)
+            .configuration(encryption)?
             .send()
         {
             Ok(_) => {
@@ -496,9 +496,9 @@ fn s3_compat_blocking_list_v2_manual_pagination() -> Result<(), Error> {
         let mut keys = Vec::new();
         let mut token = None::<String>;
         loop {
-            let mut req = client.objects().list_v2(&bucket).max_keys(1);
+            let mut req = client.objects().list_v2(&bucket).max_keys(1)?;
             if let Some(t) = token.take() {
-                req = req.continuation_token(t);
+                req = req.continuation_token(t)?;
             }
             let out = req.send()?;
             keys.extend(out.contents.iter().map(|o| o.key.clone()));
@@ -533,8 +533,8 @@ fn s3_compat_blocking_presign_put_head_delete_roundtrip() -> Result<(), Error> {
             .header(
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/plain"),
-            )
-            .metadata("m", "1")
+            )?
+            .metadata("m", "1")?
             .build()?;
 
         let mut req = ureq::agent().put(presigned_put.url.as_str());
@@ -634,7 +634,7 @@ fn s3_compat_blocking_multipart_put_get_roundtrip() -> Result<(), Error> {
         let parts = client
             .objects()
             .list_parts(&bucket, key, &upload_id)
-            .max_parts(1)
+            .max_parts(1)?
             .send()?;
         assert!(!parts.parts.is_empty());
 
@@ -644,8 +644,8 @@ fn s3_compat_blocking_multipart_put_get_roundtrip() -> Result<(), Error> {
         let parts = client
             .objects()
             .list_parts(&bucket, key, &upload_id)
-            .part_number_marker(marker)
-            .max_parts(1000)
+            .part_number_marker(marker)?
+            .max_parts(1000)?
             .send()?;
         saw_part2 = saw_part2 || parts.parts.iter().any(|p| p.part_number == 2);
 
@@ -653,8 +653,8 @@ fn s3_compat_blocking_multipart_put_get_roundtrip() -> Result<(), Error> {
             let parts = client
                 .objects()
                 .list_parts(&bucket, key, &upload_id)
-                .part_number_marker(marker.saturating_add(1))
-                .max_parts(1000)
+                .part_number_marker(marker.saturating_add(1))?
+                .max_parts(1000)?
                 .send()?;
             saw_part2 = saw_part2 || parts.parts.iter().any(|p| p.part_number == 2);
         }
@@ -666,8 +666,8 @@ fn s3_compat_blocking_multipart_put_get_roundtrip() -> Result<(), Error> {
         client
             .objects()
             .complete_multipart_upload(&bucket, key, &upload_id)
-            .part(1, etag1)
-            .part(2, etag2)
+            .part(1, etag1)?
+            .part(2, etag2)?
             .send()?;
 
         let got = client.objects().get(&bucket, key).send()?.bytes()?;
@@ -708,7 +708,7 @@ fn s3_compat_blocking_multipart_upload_part_copy_roundtrip() -> Result<(), Error
         let copied = client
             .objects()
             .upload_part_copy(&bucket, src_key, &bucket, dst_key, &upload_id, 1)
-            .copy_source_range_bytes(0, src.len() as u64 - 1)
+            .copy_source_range_bytes(0, src.len() as u64 - 1)?
             .send()?;
         let etag1 = copied
             .etag
@@ -727,8 +727,8 @@ fn s3_compat_blocking_multipart_upload_part_copy_roundtrip() -> Result<(), Error
         client
             .objects()
             .complete_multipart_upload(&bucket, dst_key, &upload_id)
-            .part(1, etag1)
-            .part(2, etag2)
+            .part(1, etag1)?
+            .part(2, etag2)?
             .send()?;
 
         let got = client.objects().get(&bucket, dst_key).send()?.bytes()?;

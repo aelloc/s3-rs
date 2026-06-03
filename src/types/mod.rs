@@ -16,10 +16,19 @@
 use http::{HeaderMap, Method};
 use url::Url;
 
-#[cfg(any(feature = "checksums", feature = "async", feature = "blocking"))]
-use crate::error::{Error, Result};
+#[cfg(any(
+    feature = "checksums",
+    feature = "multipart",
+    feature = "async",
+    feature = "blocking"
+))]
+use crate::error::Error;
+use crate::error::Result;
 #[cfg(any(feature = "async", feature = "blocking"))]
 use bytes::Bytes;
+
+#[cfg(any(test, feature = "async", feature = "blocking"))]
+pub(crate) const MAX_DELETE_OBJECTS_PER_REQUEST: usize = 1_000;
 
 #[cfg(any(test, feature = "async", feature = "blocking"))]
 pub(crate) mod xml;
@@ -332,6 +341,48 @@ fn validate_checksum_value(algorithm: ChecksumAlgorithm, value: &str) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "multipart")]
+fn validate_completed_part_number(part_number: u32) -> Result<()> {
+    if part_number == 0 || part_number > 10_000 {
+        return Err(Error::invalid_config(
+            "completed part number must be in the range 1..=10000",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "multipart")]
+fn validate_completed_part_etag(etag: &str) -> Result<()> {
+    if etag.is_empty() {
+        return Err(Error::invalid_config(
+            "completed part etag must not be empty",
+        ));
+    }
+    if etag.trim() != etag {
+        return Err(Error::invalid_config(
+            "completed part etag must not include leading or trailing whitespace",
+        ));
+    }
+    if etag
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return Err(Error::invalid_config(
+            "completed part etag must not contain ASCII control or whitespace characters",
+        ));
+    }
+    if !etag.starts_with('"') || !etag.ends_with('"') || etag.len() < 2 {
+        return Err(Error::invalid_config("completed part etag must be quoted"));
+    }
+    let inner = &etag[1..etag.len() - 1];
+    if inner.is_empty() || inner.contains('"') {
+        return Err(Error::invalid_config(
+            "completed part etag must contain a non-empty quoted token",
+        ));
+    }
+    Ok(())
+}
+
 /// Output from a DELETE object request.
 #[derive(Debug)]
 pub struct DeleteObjectOutput;
@@ -348,25 +399,37 @@ pub struct DeleteObjectsOutput {
 /// Identifier for an object in delete requests.
 #[derive(Clone, Debug)]
 pub struct DeleteObjectIdentifier {
-    /// Object key.
-    pub key: String,
-    /// Optional version id.
-    pub version_id: Option<String>,
+    key: String,
+    version_id: Option<String>,
 }
 
 impl DeleteObjectIdentifier {
     /// Creates an identifier from an object key.
-    pub fn new(key: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
+    pub fn new(key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        crate::util::validation::validate_object_key(&key)?;
+        Ok(Self {
+            key,
             version_id: None,
-        }
+        })
     }
 
     /// Sets the version id for this identifier.
-    pub fn with_version_id(mut self, version_id: impl Into<String>) -> Self {
-        self.version_id = Some(version_id.into());
-        self
+    pub fn with_version_id(mut self, version_id: impl Into<String>) -> Result<Self> {
+        let version_id = version_id.into();
+        crate::util::validation::validate_version_id(&version_id)?;
+        self.version_id = Some(version_id);
+        Ok(self)
+    }
+
+    /// Returns the object key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the optional version id.
+    pub fn version_id(&self) -> Option<&str> {
+        self.version_id.as_deref()
     }
 }
 
@@ -429,10 +492,29 @@ pub struct UploadPartOutput {
 /// Completed part descriptor for multipart completion.
 #[derive(Clone, Debug)]
 pub struct CompletedPart {
-    /// Part number.
-    pub part_number: u32,
-    /// Part etag.
-    pub etag: String,
+    part_number: u32,
+    etag: String,
+}
+
+#[cfg(feature = "multipart")]
+impl CompletedPart {
+    /// Creates a completed part descriptor.
+    pub fn new(part_number: u32, etag: impl Into<String>) -> Result<Self> {
+        validate_completed_part_number(part_number)?;
+        let etag = etag.into();
+        validate_completed_part_etag(&etag)?;
+        Ok(Self { part_number, etag })
+    }
+
+    /// Returns the part number.
+    pub fn part_number(&self) -> u32 {
+        self.part_number
+    }
+
+    /// Returns the quoted ETag for this part.
+    pub fn etag(&self) -> &str {
+        &self.etag
+    }
 }
 
 #[cfg(feature = "multipart")]

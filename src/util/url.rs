@@ -157,20 +157,7 @@ fn validate_bucket_name(bucket: &str) -> Result<(), Error> {
 }
 
 pub(crate) fn validate_object_key(key: &str) -> Result<(), Error> {
-    if key.is_empty() {
-        return Err(Error::invalid_config("object key must not be empty"));
-    }
-    if key.bytes().any(|b| b.is_ascii_control()) {
-        return Err(Error::invalid_config(
-            "object key must not contain ASCII control characters",
-        ));
-    }
-    if key.split('/').any(|segment| matches!(segment, "." | "..")) {
-        return Err(Error::invalid_config(
-            "object key must not contain '.' or '..' path segments",
-        ));
-    }
-    Ok(())
+    crate::util::validation::validate_object_key(key)
 }
 
 fn is_dns_compatible_bucket(bucket: &str) -> bool {

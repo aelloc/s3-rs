@@ -188,7 +188,7 @@ async fn cleanup_bucket_async(client: &s3::Client, bucket: &str) -> Result<(), E
 async fn delete_all_objects_async(client: &s3::Client, bucket: &str) -> Result<(), Error> {
     use http::StatusCode;
 
-    let mut pager = client.objects().list_v2(bucket).max_keys(1000).pager();
+    let mut pager = client.objects().list_v2(bucket).max_keys(1000)?.pager();
     while let Some(page) = pager.next_page().await? {
         if page.contents.is_empty() {
             break;
@@ -198,7 +198,7 @@ async fn delete_all_objects_async(client: &s3::Client, bucket: &str) -> Result<(
         if let Err(err) = client
             .objects()
             .delete_objects(bucket)
-            .objects(keys)
+            .objects(keys)?
             .send()
             .await
         {
@@ -273,7 +273,7 @@ fn cleanup_bucket_blocking(client: &s3::BlockingClient, bucket: &str) -> Result<
 fn delete_all_objects_blocking(client: &s3::BlockingClient, bucket: &str) -> Result<(), Error> {
     use http::StatusCode;
 
-    let pager = client.objects().list_v2(bucket).max_keys(1000).pager();
+    let pager = client.objects().list_v2(bucket).max_keys(1000)?.pager();
     for page in pager {
         let page = page?;
         if page.contents.is_empty() {
@@ -281,7 +281,12 @@ fn delete_all_objects_blocking(client: &s3::BlockingClient, bucket: &str) -> Res
         }
 
         let keys: Vec<String> = page.contents.into_iter().map(|o| o.key).collect();
-        match client.objects().delete_objects(bucket).objects(keys).send() {
+        match client
+            .objects()
+            .delete_objects(bucket)
+            .objects(keys)?
+            .send()
+        {
             Ok(_) => {}
             Err(Error::Api {
                 status: StatusCode::NOT_FOUND,

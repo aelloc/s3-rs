@@ -170,6 +170,34 @@ impl CredentialsProvider for CountingOkProvider {
     }
 }
 
+#[cfg(any(feature = "async", feature = "blocking"))]
+#[derive(Debug)]
+struct ExpiredOkProvider {
+    calls: std::sync::Arc<AtomicUsize>,
+}
+
+#[cfg(any(feature = "async", feature = "blocking"))]
+impl CredentialsProvider for ExpiredOkProvider {
+    #[cfg(feature = "async")]
+    fn credentials_async(&self) -> CredentialsFuture<'_> {
+        let calls = self.calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let creds = Credentials::new("AKIA_EXPIRED", "SECRET_TEST").unwrap();
+            Ok(CredentialsSnapshot::new(creds)
+                .with_expires_at(time::OffsetDateTime::now_utc() - time::Duration::seconds(1)))
+        })
+    }
+
+    #[cfg(feature = "blocking")]
+    fn credentials_blocking(&self) -> Result<CredentialsSnapshot> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let creds = Credentials::new("AKIA_EXPIRED", "SECRET_TEST").unwrap();
+        Ok(CredentialsSnapshot::new(creds)
+            .with_expires_at(time::OffsetDateTime::now_utc() - time::Duration::seconds(1)))
+    }
+}
+
 #[cfg(feature = "async")]
 #[tokio::test]
 async fn cached_provider_returns_stale_on_refresh_error_async() {
@@ -188,8 +216,8 @@ async fn cached_provider_returns_stale_on_refresh_error_async() {
     let snapshot = cached.credentials_async().await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        snapshot.credentials().access_key_id,
-        initial.credentials().access_key_id
+        snapshot.credentials().access_key_id(),
+        initial.credentials().access_key_id()
     );
     assert_eq!(snapshot.expires_at(), initial.expires_at());
 }
@@ -251,7 +279,7 @@ async fn cached_provider_singleflight_refresh_async() {
             cached
                 .credentials_async()
                 .await
-                .map(|s| s.credentials().access_key_id.clone())
+                .map(|s| s.credentials().access_key_id().to_string())
         }));
     }
 
@@ -283,7 +311,7 @@ async fn cached_provider_refresh_before_and_throttle_async() {
         .with_initial(initial);
 
     let snapshot = cached.credentials_async().await.unwrap();
-    assert_eq!(snapshot.credentials().access_key_id, "OLD");
+    assert_eq!(snapshot.credentials().access_key_id(), "OLD");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -299,8 +327,8 @@ async fn cached_provider_refresh_before_and_throttle_async() {
     let first = cached.credentials_async().await.unwrap();
     let second = cached.credentials_async().await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(first.credentials().access_key_id, "STALE");
-    assert_eq!(second.credentials().access_key_id, "STALE");
+    assert_eq!(first.credentials().access_key_id(), "STALE");
+    assert_eq!(second.credentials().access_key_id(), "STALE");
 }
 
 #[cfg(feature = "async")]
@@ -317,7 +345,7 @@ async fn cached_provider_huge_refresh_before_does_not_overflow_async() {
 
     let snapshot = cached.credentials_async().await.unwrap();
 
-    assert_eq!(snapshot.credentials().access_key_id, "AKIA_0");
+    assert_eq!(snapshot.credentials().access_key_id(), "AKIA_0");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -333,9 +361,21 @@ async fn cached_provider_force_refresh_bypasses_throttle_async() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_ne!(
-        first.credentials().access_key_id,
-        second.credentials().access_key_id
+        first.credentials().access_key_id(),
+        second.credentials().access_key_id()
     );
+}
+
+#[cfg(all(feature = "async", feature = "blocking"))]
+#[tokio::test]
+async fn cached_provider_blocking_path_is_safe_inside_tokio_runtime() {
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let cached = CachedProvider::new(CountingOkProvider::new(calls.clone()));
+
+    let snapshot = cached.credentials_blocking().unwrap();
+
+    assert_eq!(snapshot.credentials().access_key_id(), "AKIA_0");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(feature = "async")]
@@ -359,6 +399,25 @@ async fn cached_provider_throttles_failed_refresh_without_cache_async() {
         other => panic!("expected throttled transport error, got {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "async")]
+#[tokio::test]
+async fn cached_provider_rejects_expired_refresh_without_cache_async() {
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let cached = CachedProvider::new(ExpiredOkProvider {
+        calls: calls.clone(),
+    })
+    .min_refresh_interval(Duration::from_secs(0));
+
+    match cached.credentials_async().await {
+        Err(Error::InvalidConfig { message }) => assert!(message.contains("expired")),
+        other => panic!("expected expired credentials error, got {other:?}"),
+    }
+
+    let second = cached.credentials_async().await;
+    assert!(second.is_err(), "expired snapshot must not be cached");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(feature = "async")]
@@ -398,8 +457,8 @@ fn cached_provider_returns_stale_on_refresh_error_blocking() {
     let snapshot = cached.credentials_blocking().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
-        snapshot.credentials().access_key_id,
-        initial.credentials().access_key_id
+        snapshot.credentials().access_key_id(),
+        initial.credentials().access_key_id()
     );
     assert_eq!(snapshot.expires_at(), initial.expires_at());
 }
@@ -468,7 +527,7 @@ fn cached_provider_singleflight_refresh_blocking() {
         threads.push(thread::spawn(move || {
             cached
                 .credentials_blocking()
-                .map(|s| s.credentials().access_key_id.clone())
+                .map(|s| s.credentials().access_key_id().to_string())
         }));
     }
 
@@ -504,7 +563,7 @@ fn cached_provider_refresh_before_and_throttle_blocking() {
         .with_initial(initial);
 
     let snapshot = cached.credentials_blocking().unwrap();
-    assert_eq!(snapshot.credentials().access_key_id, "OLD");
+    assert_eq!(snapshot.credentials().access_key_id(), "OLD");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -520,8 +579,8 @@ fn cached_provider_refresh_before_and_throttle_blocking() {
     let first = cached.credentials_blocking().unwrap();
     let second = cached.credentials_blocking().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(first.credentials().access_key_id, "STALE");
-    assert_eq!(second.credentials().access_key_id, "STALE");
+    assert_eq!(first.credentials().access_key_id(), "STALE");
+    assert_eq!(second.credentials().access_key_id(), "STALE");
 }
 
 #[cfg(feature = "blocking")]
@@ -538,7 +597,7 @@ fn cached_provider_huge_refresh_before_does_not_overflow_blocking() {
 
     let snapshot = cached.credentials_blocking().unwrap();
 
-    assert_eq!(snapshot.credentials().access_key_id, "AKIA_0");
+    assert_eq!(snapshot.credentials().access_key_id(), "AKIA_0");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -554,8 +613,8 @@ fn cached_provider_force_refresh_bypasses_throttle_blocking() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_ne!(
-        first.credentials().access_key_id,
-        second.credentials().access_key_id
+        first.credentials().access_key_id(),
+        second.credentials().access_key_id()
     );
 }
 
@@ -580,6 +639,25 @@ fn cached_provider_throttles_failed_refresh_without_cache_blocking() {
         other => panic!("expected throttled transport error, got {other:?}"),
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "blocking")]
+#[test]
+fn cached_provider_rejects_expired_refresh_without_cache_blocking() {
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let cached = CachedProvider::new(ExpiredOkProvider {
+        calls: calls.clone(),
+    })
+    .min_refresh_interval(Duration::from_secs(0));
+
+    match cached.credentials_blocking() {
+        Err(Error::InvalidConfig { message }) => assert!(message.contains("expired")),
+        other => panic!("expected expired credentials error, got {other:?}"),
+    }
+
+    let second = cached.credentials_blocking();
+    assert!(second.is_err(), "expired snapshot must not be cached");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(feature = "blocking")]

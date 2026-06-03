@@ -80,7 +80,7 @@ async fn main() -> Result<(), s3::Error> {
     client
         .objects()
         .put(&bucket, &key)
-        .content_type("text/plain")
+        .content_type("text/plain")?
         .body_bytes(b"hello r2\n".to_vec())
         .send()
         .await?;

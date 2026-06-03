@@ -64,10 +64,15 @@ fn bench_presign_async(c: &mut Criterion) {
                     .objects()
                     .presign_put(black_box(bucket), black_box(key))
                     .expires_in(Duration::from_secs(60))
+                    .expect("valid presign expiry")
                     .header(http::header::CONTENT_TYPE, ct.clone())
+                    .expect("valid presign header")
                     .metadata("m1", "v1")
+                    .expect("valid metadata")
                     .metadata("m2", "v2")
+                    .expect("valid metadata")
                     .query_param("x-id", "PutObject")
+                    .expect("valid query parameter")
                     .build()
                     .expect("presign must succeed");
                 black_box(req);
@@ -112,10 +117,15 @@ fn bench_presign_blocking(c: &mut Criterion) {
                     .objects()
                     .presign_put(black_box(bucket), black_box(key))
                     .expires_in(Duration::from_secs(60))
+                    .expect("valid presign expiry")
                     .header(http::header::CONTENT_TYPE, ct.clone())
+                    .expect("valid presign header")
                     .metadata("m1", "v1")
+                    .expect("valid metadata")
                     .metadata("m2", "v2")
+                    .expect("valid metadata")
                     .query_param("x-id", "PutObject")
+                    .expect("valid query parameter")
                     .build()
                     .expect("presign must succeed");
                 black_box(req);

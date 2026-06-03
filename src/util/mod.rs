@@ -24,5 +24,6 @@ pub(crate) mod signing;
 pub(crate) mod text;
 #[cfg(any(test, feature = "async", feature = "blocking"))]
 pub(crate) mod url;
+pub(crate) mod validation;
 #[cfg(any(test, feature = "async", feature = "blocking"))]
 pub(crate) mod xml;

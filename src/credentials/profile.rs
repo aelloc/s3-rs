@@ -16,13 +16,14 @@ pub(crate) fn profile_from_env() -> Result<String, Error> {
 }
 
 pub(crate) fn load_profile_credentials(profile: &str) -> Result<Credentials, Error> {
+    let profile = validate_profile_name("profile", profile.to_string())?;
     let creds_ini = read_ini_file(&credentials_path()?)?;
     let config_ini = match config_path() {
         Ok(path) if path.exists() => read_ini_file(&path)?,
         _ => HashMap::new(),
     };
 
-    let profile_section_credentials = profile.to_string();
+    let profile_section_credentials = profile.clone();
     let profile_section_config = if profile == "default" {
         "default".to_string()
     } else {
@@ -239,5 +240,14 @@ ignored = outside
         assert!(validate_profile_name("AWS_PROFILE", " dev".to_string()).is_err());
         assert!(validate_profile_name("AWS_PROFILE", "dev ".to_string()).is_err());
         assert!(validate_profile_name("AWS_PROFILE", "dev\nprofile".to_string()).is_err());
+    }
+
+    #[test]
+    fn load_profile_credentials_rejects_invalid_profile_before_io() {
+        match load_profile_credentials(" dev") {
+            Err(Error::InvalidConfig { message }) => assert!(message.contains("profile")),
+            Err(other) => panic!("expected invalid config, got {other:?}"),
+            Ok(_) => panic!("expected invalid profile to fail"),
+        }
     }
 }

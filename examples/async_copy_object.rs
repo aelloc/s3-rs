@@ -51,7 +51,7 @@ async fn main() -> Result<(), s3::Error> {
     client
         .objects()
         .put(&bucket, &src)
-        .content_type("text/plain")
+        .content_type("text/plain")?
         .body_bytes(b"copy me\n".to_vec())
         .send()
         .await?;
@@ -60,7 +60,7 @@ async fn main() -> Result<(), s3::Error> {
         .objects()
         .copy(&bucket, &src, &bucket, &dst)
         .replace_metadata()
-        .metadata("copied", "true")
+        .metadata("copied", "true")?
         .send()
         .await?;
 

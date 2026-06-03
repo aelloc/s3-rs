@@ -1,10 +1,11 @@
 //! Async bucket operations.
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode};
 
 use super::common::{
-    create_bucket_location_constraint, parse_async_xml_response, validate_subresource,
+    create_bucket_location_constraint, parse_async_xml_response, require_configured,
+    validate_subresource, xml_body_headers,
 };
 
 use crate::{
@@ -88,7 +89,7 @@ impl BucketsService {
         PutBucketVersioningRequest {
             client: self.client.clone(),
             bucket: bucket.into(),
-            configuration: BucketVersioningConfiguration::default(),
+            configuration: None,
         }
     }
 
@@ -105,7 +106,7 @@ impl BucketsService {
         PutBucketLifecycleRequest {
             client: self.client.clone(),
             bucket: bucket.into(),
-            configuration: BucketLifecycleConfiguration::default(),
+            configuration: None,
         }
     }
 
@@ -130,7 +131,7 @@ impl BucketsService {
         PutBucketCorsRequest {
             client: self.client.clone(),
             bucket: bucket.into(),
-            configuration: BucketCorsConfiguration::default(),
+            configuration: None,
         }
     }
 
@@ -155,7 +156,7 @@ impl BucketsService {
         PutBucketTaggingRequest {
             client: self.client.clone(),
             bucket: bucket.into(),
-            tagging: BucketTagging::default(),
+            tagging: None,
         }
     }
 
@@ -180,7 +181,7 @@ impl BucketsService {
         PutBucketEncryptionRequest {
             client: self.client.clone(),
             bucket: bucket.into(),
-            configuration: BucketEncryptionConfiguration::default(),
+            configuration: None,
         }
     }
 
@@ -211,7 +212,7 @@ impl BucketsService {
         PutBucketPublicAccessBlockRequest {
             client: self.client.clone(),
             bucket: bucket.into(),
-            configuration: BucketPublicAccessBlockConfiguration::default(),
+            configuration: None,
         }
     }
 
@@ -354,9 +355,11 @@ pub struct CreateBucketRequest {
 
 impl CreateBucketRequest {
     /// Sets the location constraint for bucket creation.
-    pub fn location_constraint(mut self, region: impl Into<String>) -> Self {
-        self.location_constraint = Some(region.into());
-        self
+    pub fn location_constraint(mut self, region: impl Into<String>) -> Result<Self> {
+        let region = region.into();
+        crate::auth::Region::new(region.as_str())?;
+        self.location_constraint = Some(region);
+        Ok(self)
     }
 
     /// Sends the request.
@@ -367,14 +370,7 @@ impl CreateBucketRequest {
         let body = match location_constraint {
             Some(region) => {
                 let body = crate::util::xml::encode_create_bucket_configuration(&region)?;
-                headers.insert(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/xml"),
-                );
-                headers.insert(
-                    http::header::HeaderName::from_static("content-md5"),
-                    crate::util::md5::content_md5_header_value(body.as_ref())?,
-                );
+                headers = xml_body_headers(body.as_ref())?;
                 AsyncBody::Bytes(body)
             }
             None => AsyncBody::Empty,
@@ -462,28 +458,25 @@ impl GetBucketVersioningRequest {
 pub struct PutBucketVersioningRequest {
     client: Client,
     bucket: String,
-    configuration: BucketVersioningConfiguration,
+    configuration: Option<BucketVersioningConfiguration>,
 }
 
 impl PutBucketVersioningRequest {
     /// Sets the versioning configuration to apply.
-    pub fn configuration(mut self, value: BucketVersioningConfiguration) -> Self {
-        self.configuration = value;
-        self
+    pub fn configuration(mut self, value: BucketVersioningConfiguration) -> Result<Self> {
+        crate::util::xml::validate_bucket_versioning(&value)?;
+        self.configuration = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
     pub async fn send(self) -> Result<PutBucketVersioningOutput> {
-        let body = crate::util::xml::encode_bucket_versioning(&self.configuration)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(body.as_ref())?,
-        );
+        let configuration = require_configured(
+            self.configuration,
+            "put_versioning requires a configuration",
+        )?;
+        let body = crate::util::xml::encode_bucket_versioning(&configuration)?;
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self
             .client
@@ -565,7 +558,7 @@ impl GetBucketLifecycleRequest {
 /// let output = client
 ///     .buckets()
 ///     .put_lifecycle("my-bucket")
-///     .configuration(config)
+///     .configuration(config)?
 ///     .send()
 ///     .await?;
 /// # let _ = output;
@@ -575,28 +568,23 @@ impl GetBucketLifecycleRequest {
 pub struct PutBucketLifecycleRequest {
     client: Client,
     bucket: String,
-    configuration: BucketLifecycleConfiguration,
+    configuration: Option<BucketLifecycleConfiguration>,
 }
 
 impl PutBucketLifecycleRequest {
     /// Sets the lifecycle configuration to apply.
-    pub fn configuration(mut self, value: BucketLifecycleConfiguration) -> Self {
-        self.configuration = value;
-        self
+    pub fn configuration(mut self, value: BucketLifecycleConfiguration) -> Result<Self> {
+        crate::util::xml::validate_bucket_lifecycle(&value)?;
+        self.configuration = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
     pub async fn send(self) -> Result<PutBucketLifecycleOutput> {
-        let body = crate::util::xml::encode_bucket_lifecycle(&self.configuration)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(body.as_ref())?,
-        );
+        let configuration =
+            require_configured(self.configuration, "put_lifecycle requires a configuration")?;
+        let body = crate::util::xml::encode_bucket_lifecycle(&configuration)?;
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self
             .client
@@ -680,28 +668,23 @@ impl GetBucketCorsRequest {
 pub struct PutBucketCorsRequest {
     client: Client,
     bucket: String,
-    configuration: BucketCorsConfiguration,
+    configuration: Option<BucketCorsConfiguration>,
 }
 
 impl PutBucketCorsRequest {
     /// Sets the CORS configuration to apply.
-    pub fn configuration(mut self, value: BucketCorsConfiguration) -> Self {
-        self.configuration = value;
-        self
+    pub fn configuration(mut self, value: BucketCorsConfiguration) -> Result<Self> {
+        crate::util::xml::validate_bucket_cors(&value)?;
+        self.configuration = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
     pub async fn send(self) -> Result<PutBucketCorsOutput> {
-        let body = crate::util::xml::encode_bucket_cors(&self.configuration)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(body.as_ref())?,
-        );
+        let configuration =
+            require_configured(self.configuration, "put_cors requires a configuration")?;
+        let body = crate::util::xml::encode_bucket_cors(&configuration)?;
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self
             .client
@@ -785,28 +768,22 @@ impl GetBucketTaggingRequest {
 pub struct PutBucketTaggingRequest {
     client: Client,
     bucket: String,
-    tagging: BucketTagging,
+    tagging: Option<BucketTagging>,
 }
 
 impl PutBucketTaggingRequest {
     /// Sets the tag set to apply.
-    pub fn tagging(mut self, value: BucketTagging) -> Self {
-        self.tagging = value;
-        self
+    pub fn tagging(mut self, value: BucketTagging) -> Result<Self> {
+        crate::util::xml::validate_bucket_tagging(&value)?;
+        self.tagging = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
     pub async fn send(self) -> Result<PutBucketTaggingOutput> {
-        let body = crate::util::xml::encode_bucket_tagging(&self.tagging)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(body.as_ref())?,
-        );
+        let tagging = require_configured(self.tagging, "put_tagging requires a tag set")?;
+        let body = crate::util::xml::encode_bucket_tagging(&tagging)?;
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self
             .client
@@ -890,28 +867,25 @@ impl GetBucketEncryptionRequest {
 pub struct PutBucketEncryptionRequest {
     client: Client,
     bucket: String,
-    configuration: BucketEncryptionConfiguration,
+    configuration: Option<BucketEncryptionConfiguration>,
 }
 
 impl PutBucketEncryptionRequest {
     /// Sets the encryption configuration to apply.
-    pub fn configuration(mut self, value: BucketEncryptionConfiguration) -> Self {
-        self.configuration = value;
-        self
+    pub fn configuration(mut self, value: BucketEncryptionConfiguration) -> Result<Self> {
+        crate::util::xml::validate_bucket_encryption(&value)?;
+        self.configuration = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
     pub async fn send(self) -> Result<PutBucketEncryptionOutput> {
-        let body = crate::util::xml::encode_bucket_encryption(&self.configuration)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(body.as_ref())?,
-        );
+        let configuration = require_configured(
+            self.configuration,
+            "put_encryption requires a configuration",
+        )?;
+        let body = crate::util::xml::encode_bucket_encryption(&configuration)?;
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self
             .client
@@ -995,28 +969,24 @@ impl GetBucketPublicAccessBlockRequest {
 pub struct PutBucketPublicAccessBlockRequest {
     client: Client,
     bucket: String,
-    configuration: BucketPublicAccessBlockConfiguration,
+    configuration: Option<BucketPublicAccessBlockConfiguration>,
 }
 
 impl PutBucketPublicAccessBlockRequest {
     /// Sets the public access block configuration to apply.
     pub fn configuration(mut self, value: BucketPublicAccessBlockConfiguration) -> Self {
-        self.configuration = value;
+        self.configuration = Some(value);
         self
     }
 
     /// Sends the request.
     pub async fn send(self) -> Result<PutBucketPublicAccessBlockOutput> {
-        let body = crate::util::xml::encode_bucket_public_access_block(&self.configuration)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(body.as_ref())?,
-        );
+        let configuration = require_configured(
+            self.configuration,
+            "put_public_access_block requires a configuration",
+        )?;
+        let body = crate::util::xml::encode_bucket_public_access_block(&configuration)?;
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self
             .client
@@ -1109,15 +1079,27 @@ pub struct PutBucketConfigRawRequest {
 
 impl PutBucketConfigRawRequest {
     /// Sets the request body from an XML string.
-    pub fn body_xml(mut self, xml: impl Into<String>) -> Self {
-        self.body = Bytes::from(xml.into());
-        self
+    pub fn body_xml(mut self, xml: impl Into<String>) -> Result<Self> {
+        let xml = xml.into();
+        if xml.is_empty() {
+            return Err(Error::invalid_config(
+                "put_config_raw requires a request body",
+            ));
+        }
+        self.body = Bytes::from(xml);
+        Ok(self)
     }
 
     /// Sets the request body from raw bytes.
-    pub fn body_bytes(mut self, bytes: impl Into<Bytes>) -> Self {
-        self.body = bytes.into();
-        self
+    pub fn body_bytes(mut self, bytes: impl Into<Bytes>) -> Result<Self> {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Err(Error::invalid_config(
+                "put_config_raw requires a request body",
+            ));
+        }
+        self.body = bytes;
+        Ok(self)
     }
 
     /// Sends the request.
@@ -1129,15 +1111,7 @@ impl PutBucketConfigRawRequest {
             ));
         }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            crate::util::md5::content_md5_header_value(self.body.as_ref())?,
-        );
+        let headers = xml_body_headers(self.body.as_ref())?;
 
         let resp = self
             .client
@@ -1188,5 +1162,120 @@ impl DeleteBucketConfigRawRequest {
         }
 
         Err(response_error(resp))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        Auth,
+        types::{
+            BucketCorsConfiguration, BucketEncryptionConfiguration, BucketLifecycleConfiguration,
+            BucketTagging, BucketVersioningConfiguration, Tag,
+        },
+    };
+
+    fn test_client() -> Client {
+        Client::builder("https://s3.example.com")
+            .expect("builder should parse")
+            .region("us-east-1")
+            .auth(Auth::Anonymous)
+            .build()
+            .expect("client should build")
+    }
+
+    fn assert_invalid_config<T>(result: Result<T>, expected: &str) {
+        match result {
+            Err(Error::InvalidConfig { message }) => assert!(
+                message.contains(expected),
+                "expected {message:?} to contain {expected:?}"
+            ),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig"),
+        }
+    }
+
+    #[test]
+    fn bucket_config_setters_reject_invalid_values() {
+        let buckets = test_client().buckets();
+
+        assert_invalid_config(
+            buckets.create("bucket").location_constraint(" eu-west-1"),
+            "region",
+        );
+        assert_invalid_config(
+            buckets
+                .put_versioning("bucket")
+                .configuration(BucketVersioningConfiguration::default()),
+            "versioning",
+        );
+        assert_invalid_config(
+            buckets
+                .put_lifecycle("bucket")
+                .configuration(BucketLifecycleConfiguration::default()),
+            "lifecycle",
+        );
+        assert_invalid_config(
+            buckets
+                .put_cors("bucket")
+                .configuration(BucketCorsConfiguration::default()),
+            "cors",
+        );
+        assert_invalid_config(
+            buckets.put_tagging("bucket").tagging(BucketTagging {
+                tags: vec![Tag {
+                    key: String::new(),
+                    value: "value".to_string(),
+                }],
+            }),
+            "tag key",
+        );
+        assert_invalid_config(
+            buckets
+                .put_encryption("bucket")
+                .configuration(BucketEncryptionConfiguration::default()),
+            "encryption",
+        );
+        assert_invalid_config(
+            buckets.put_config_raw("bucket", "versioning").body_xml(""),
+            "request body",
+        );
+        assert_invalid_config(
+            buckets
+                .put_config_raw("bucket", "versioning")
+                .body_bytes(Bytes::new()),
+            "request body",
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_config_send_requires_explicit_configuration() {
+        let buckets = test_client().buckets();
+
+        assert_invalid_config(
+            buckets.put_versioning("bucket").send().await,
+            "requires a configuration",
+        );
+        assert_invalid_config(
+            buckets.put_lifecycle("bucket").send().await,
+            "requires a configuration",
+        );
+        assert_invalid_config(
+            buckets.put_cors("bucket").send().await,
+            "requires a configuration",
+        );
+        assert_invalid_config(
+            buckets.put_tagging("bucket").send().await,
+            "requires a tag set",
+        );
+        assert_invalid_config(
+            buckets.put_encryption("bucket").send().await,
+            "requires a configuration",
+        );
+        assert_invalid_config(
+            buckets.put_public_access_block("bucket").send().await,
+            "requires a configuration",
+        );
     }
 }

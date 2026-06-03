@@ -79,8 +79,8 @@ async fn main() -> Result<(), s3::Error> {
         client
             .objects()
             .complete_multipart_upload(&bucket, &key, &upload_id)
-            .part(1, etag1)
-            .part(2, etag2)
+            .part(1, etag1)?
+            .part(2, etag2)?
             .send()
             .await?;
         Ok::<(), s3::Error>(())

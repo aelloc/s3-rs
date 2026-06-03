@@ -178,7 +178,7 @@ async fn s3_compat_async_list_buckets_and_bucket_configs() -> Result<(), Error> 
             match client
                 .buckets()
                 .put_versioning(&bucket)
-                .configuration(versioning)
+                .configuration(versioning)?
                 .send()
                 .await
             {
@@ -196,7 +196,7 @@ async fn s3_compat_async_list_buckets_and_bucket_configs() -> Result<(), Error> 
                     match client
                         .buckets()
                         .put_versioning(&bucket)
-                        .configuration(versioning)
+                        .configuration(versioning)?
                         .send()
                         .await
                     {
@@ -230,7 +230,7 @@ async fn s3_compat_async_list_buckets_and_bucket_configs() -> Result<(), Error> 
             match client
                 .buckets()
                 .put_tagging(&bucket)
-                .tagging(tagging)
+                .tagging(tagging)?
                 .send()
                 .await
             {
@@ -273,7 +273,7 @@ async fn s3_compat_async_list_buckets_and_bucket_configs() -> Result<(), Error> 
             match client
                 .buckets()
                 .put_cors(&bucket)
-                .configuration(cors)
+                .configuration(cors)?
                 .send()
                 .await
             {
@@ -313,7 +313,7 @@ async fn s3_compat_async_list_buckets_and_bucket_configs() -> Result<(), Error> 
             match client
                 .buckets()
                 .put_lifecycle(&bucket)
-                .configuration(lifecycle)
+                .configuration(lifecycle)?
                 .send()
                 .await
             {
@@ -354,7 +354,7 @@ async fn s3_compat_async_list_buckets_and_bucket_configs() -> Result<(), Error> 
             match client
                 .buckets()
                 .put_encryption(&bucket)
-                .configuration(encryption)
+                .configuration(encryption)?
                 .send()
                 .await
             {
@@ -438,7 +438,7 @@ async fn s3_compat_async_get_range_and_conditions() -> Result<(), Error> {
             let put = client
                 .objects()
                 .put(&bucket, key)
-                .content_type("text/plain")
+                .content_type("text/plain")?
                 .body_bytes(body.clone())
                 .send()
                 .await?;
@@ -450,7 +450,7 @@ async fn s3_compat_async_get_range_and_conditions() -> Result<(), Error> {
             let got = client
                 .objects()
                 .get(&bucket, key)
-                .range_bytes(0, 4)
+                .range_bytes(0, 4)?
                 .send()
                 .await?
                 .bytes()
@@ -460,7 +460,7 @@ async fn s3_compat_async_get_range_and_conditions() -> Result<(), Error> {
             let ok = client
                 .objects()
                 .get(&bucket, key)
-                .if_match(etag.clone())
+                .if_match(etag.clone())?
                 .send()
                 .await?
                 .bytes()
@@ -471,7 +471,7 @@ async fn s3_compat_async_get_range_and_conditions() -> Result<(), Error> {
             match client
                 .objects()
                 .get(&bucket, key)
-                .if_match(r#""00000000000000000000000000000000""#)
+                .if_match(r#""00000000000000000000000000000000""#)?
                 .send()
                 .await
             {
@@ -497,7 +497,7 @@ async fn s3_compat_async_get_range_and_conditions() -> Result<(), Error> {
             match client
                 .objects()
                 .get(&bucket, key)
-                .if_none_match(etag)
+                .if_none_match(etag)?
                 .send()
                 .await
             {
@@ -551,9 +551,9 @@ async fn s3_compat_async_list_v2_manual_pagination() -> Result<(), Error> {
             let mut keys = Vec::new();
             let mut token = None::<String>;
             loop {
-                let mut req = client.objects().list_v2(&bucket).max_keys(1);
+                let mut req = client.objects().list_v2(&bucket).max_keys(1)?;
                 if let Some(t) = token.take() {
-                    req = req.continuation_token(t);
+                    req = req.continuation_token(t)?;
                 }
                 let out = req.send().await?;
                 keys.extend(out.contents.iter().map(|o| o.key.clone()));
@@ -571,7 +571,7 @@ async fn s3_compat_async_list_v2_manual_pagination() -> Result<(), Error> {
             let out = client
                 .objects()
                 .list_v2(&bucket)
-                .start_after("a.txt")
+                .start_after("a.txt")?
                 .send()
                 .await?;
             assert!(out.contents.iter().all(|o| o.key.as_str() > "a.txt"));
@@ -604,8 +604,8 @@ async fn s3_compat_async_list_v2_pager_and_common_prefixes() -> Result<(), Error
             let mut pager = client
                 .objects()
                 .list_v2(&bucket)
-                .prefix("a/")
-                .max_keys(2)
+                .prefix("a/")?
+                .max_keys(2)?
                 .pager();
             let mut keys = Vec::new();
             while let Some(page) = pager.next_page().await? {
@@ -617,7 +617,7 @@ async fn s3_compat_async_list_v2_pager_and_common_prefixes() -> Result<(), Error
             let out = client
                 .objects()
                 .list_v2(&bucket)
-                .delimiter("/")
+                .delimiter("/")?
                 .send()
                 .await?;
             assert!(out.common_prefixes.iter().any(|p| p == "a/"));
@@ -654,8 +654,8 @@ async fn s3_compat_async_presign_put_head_delete_roundtrip() -> Result<(), Error
                 .header(
                     http::header::CONTENT_TYPE,
                     HeaderValue::from_static("text/plain"),
-                )
-                .metadata("m", "1")
+                )?
+                .metadata("m", "1")?
                 .build()?;
 
             let resp = reqwest::Client::new()
@@ -726,8 +726,8 @@ async fn s3_compat_async_copy_object_roundtrip() -> Result<(), Error> {
             client
                 .objects()
                 .put(&bucket, src)
-                .content_type("text/plain")
-                .metadata("x", "1")
+                .content_type("text/plain")?
+                .metadata("x", "1")?
                 .body_bytes(body.clone())
                 .send()
                 .await?;
@@ -736,8 +736,8 @@ async fn s3_compat_async_copy_object_roundtrip() -> Result<(), Error> {
                 .objects()
                 .copy(&bucket, src, &bucket, dst)
                 .replace_metadata()
-                .content_type("text/plain")
-                .metadata("y", "2")
+                .content_type("text/plain")?
+                .metadata("y", "2")?
                 .send()
                 .await?;
 
@@ -789,8 +789,8 @@ async fn s3_compat_async_delete_objects_batch() -> Result<(), Error> {
             let out = client
                 .objects()
                 .delete_objects(&bucket)
-                .object("k1")
-                .object("k2")
+                .object("k1")?
+                .object("k2")?
                 .send()
                 .await?;
             assert!(out.errors.is_empty());
@@ -846,7 +846,7 @@ async fn s3_compat_async_multipart_put_get_roundtrip() -> Result<(), Error> {
             let parts = client
                 .objects()
                 .list_parts(&bucket, key, &upload_id)
-                .max_parts(1)
+                .max_parts(1)?
                 .send()
                 .await?;
             assert!(!parts.parts.is_empty());
@@ -857,8 +857,8 @@ async fn s3_compat_async_multipart_put_get_roundtrip() -> Result<(), Error> {
             let parts = client
                 .objects()
                 .list_parts(&bucket, key, &upload_id)
-                .part_number_marker(marker)
-                .max_parts(1000)
+                .part_number_marker(marker)?
+                .max_parts(1000)?
                 .send()
                 .await?;
             saw_part2 = saw_part2 || parts.parts.iter().any(|p| p.part_number == 2);
@@ -867,8 +867,8 @@ async fn s3_compat_async_multipart_put_get_roundtrip() -> Result<(), Error> {
                 let parts = client
                     .objects()
                     .list_parts(&bucket, key, &upload_id)
-                    .part_number_marker(marker.saturating_add(1))
-                    .max_parts(1000)
+                    .part_number_marker(marker.saturating_add(1))?
+                    .max_parts(1000)?
                     .send()
                     .await?;
                 saw_part2 = saw_part2 || parts.parts.iter().any(|p| p.part_number == 2);
@@ -881,8 +881,8 @@ async fn s3_compat_async_multipart_put_get_roundtrip() -> Result<(), Error> {
             client
                 .objects()
                 .complete_multipart_upload(&bucket, key, &upload_id)
-                .part(1, etag1)
-                .part(2, etag2)
+                .part(1, etag1)?
+                .part(2, etag2)?
                 .send()
                 .await?;
 
@@ -936,7 +936,7 @@ async fn s3_compat_async_multipart_upload_part_copy_roundtrip() -> Result<(), Er
             let copied = client
                 .objects()
                 .upload_part_copy(&bucket, src_key, &bucket, dst_key, &upload_id, 1)
-                .copy_source_range_bytes(0, src.len() as u64 - 1)
+                .copy_source_range_bytes(0, src.len() as u64 - 1)?
                 .send()
                 .await?;
             let etag1 = copied
@@ -957,8 +957,8 @@ async fn s3_compat_async_multipart_upload_part_copy_roundtrip() -> Result<(), Er
             client
                 .objects()
                 .complete_multipart_upload(&bucket, dst_key, &upload_id)
-                .part(1, etag1)
-                .part(2, etag2)
+                .part(1, etag1)?
+                .part(2, etag2)?
                 .send()
                 .await?;
 

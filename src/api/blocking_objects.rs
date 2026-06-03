@@ -11,13 +11,14 @@ use super::blocking_common::{parse_blocking_xml_response, read_response_error};
 use super::common::parse_xml_or_service_error;
 use super::common::{
     ByteRange, apply_copy_metadata_headers, apply_metadata_headers, insert_header,
-    insert_optional_header, validate_content_length_matches_body, validate_max_keys,
-    validate_query_token, validate_query_value,
+    insert_optional_header, next_list_v2_continuation_token, push_delete_object, push_metadata,
+    validate_content_length_matches_body, validate_header_value, validate_max_keys,
+    validate_query_token, validate_query_value, xml_body_headers,
 };
 #[cfg(feature = "multipart")]
 use super::common::{
-    prepare_completed_parts, validate_max_parts, validate_part_number_marker, validate_upload_id,
-    validate_upload_part_number,
+    prepare_completed_parts, push_completed_part, validate_max_parts, validate_part_number_marker,
+    validate_upload_id, validate_upload_part_number,
 };
 
 use crate::{
@@ -405,33 +406,41 @@ pub struct BlockingGetObjectRequest {
 
 impl BlockingGetObjectRequest {
     /// Sets an inclusive byte range.
-    pub fn range_bytes(mut self, start: u64, end_inclusive: u64) -> Self {
-        self.range = Some(ByteRange::new(start, end_inclusive));
-        self
+    pub fn range_bytes(mut self, start: u64, end_inclusive: u64) -> Result<Self> {
+        self.range = Some(ByteRange::new(start, end_inclusive)?);
+        Ok(self)
     }
 
     /// Adds an If-Match condition.
-    pub fn if_match(mut self, value: impl Into<String>) -> Self {
-        self.if_match = Some(value.into());
-        self
+    pub fn if_match(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid If-Match header")?;
+        self.if_match = Some(value);
+        Ok(self)
     }
 
     /// Adds an If-None-Match condition.
-    pub fn if_none_match(mut self, value: impl Into<String>) -> Self {
-        self.if_none_match = Some(value.into());
-        self
+    pub fn if_none_match(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid If-None-Match header")?;
+        self.if_none_match = Some(value);
+        Ok(self)
     }
 
     /// Adds an If-Modified-Since condition.
-    pub fn if_modified_since(mut self, value: impl Into<String>) -> Self {
-        self.if_modified_since = Some(value.into());
-        self
+    pub fn if_modified_since(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid If-Modified-Since header")?;
+        self.if_modified_since = Some(value);
+        Ok(self)
     }
 
     /// Adds an If-Unmodified-Since condition.
-    pub fn if_unmodified_since(mut self, value: impl Into<String>) -> Self {
-        self.if_unmodified_since = Some(value.into());
-        self
+    pub fn if_unmodified_since(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid If-Unmodified-Since header")?;
+        self.if_unmodified_since = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
@@ -558,7 +567,7 @@ impl BlockingHeadObjectRequest {
 /// let output = client
 ///     .objects()
 ///     .put("my-bucket", "notes/hello.txt")
-///     .content_type("text/plain; charset=utf-8")
+///     .content_type("text/plain; charset=utf-8")?
 ///     .body_bytes("hello from s3-rs")
 ///     .send()?;
 /// # let _ = output;
@@ -584,39 +593,51 @@ pub struct BlockingPutObjectRequest {
 
 impl BlockingPutObjectRequest {
     /// Sets the Content-Type header.
-    pub fn content_type(mut self, value: impl Into<String>) -> Self {
-        self.content_type = Some(value.into());
-        self
+    pub fn content_type(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Content-Type header")?;
+        self.content_type = Some(value);
+        Ok(self)
     }
 
     /// Sets the Cache-Control header.
-    pub fn cache_control(mut self, value: impl Into<String>) -> Self {
-        self.cache_control = Some(value.into());
-        self
+    pub fn cache_control(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Cache-Control header")?;
+        self.cache_control = Some(value);
+        Ok(self)
     }
 
     /// Sets the Content-Disposition header.
-    pub fn content_disposition(mut self, value: impl Into<String>) -> Self {
-        self.content_disposition = Some(value.into());
-        self
+    pub fn content_disposition(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Content-Disposition header")?;
+        self.content_disposition = Some(value);
+        Ok(self)
     }
 
     /// Sets the Content-Encoding header.
-    pub fn content_encoding(mut self, value: impl Into<String>) -> Self {
-        self.content_encoding = Some(value.into());
-        self
+    pub fn content_encoding(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Content-Encoding header")?;
+        self.content_encoding = Some(value);
+        Ok(self)
     }
 
     /// Sets the Content-Language header.
-    pub fn content_language(mut self, value: impl Into<String>) -> Self {
-        self.content_language = Some(value.into());
-        self
+    pub fn content_language(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Content-Language header")?;
+        self.content_language = Some(value);
+        Ok(self)
     }
 
     /// Sets the Expires header.
-    pub fn expires(mut self, value: impl Into<String>) -> Self {
-        self.expires = Some(value.into());
-        self
+    pub fn expires(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Expires header")?;
+        self.expires = Some(value);
+        Ok(self)
     }
 
     /// Sets the content length (required for reader bodies).
@@ -626,9 +647,9 @@ impl BlockingPutObjectRequest {
     }
 
     /// Adds a user metadata entry.
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.push((key.into(), value.into()));
-        self
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        push_metadata(&mut self.metadata, key, value)?;
+        Ok(self)
     }
 
     #[cfg(feature = "checksums")]
@@ -792,9 +813,9 @@ pub struct BlockingDeleteObjectsRequest {
 
 impl BlockingDeleteObjectsRequest {
     /// Adds an object key to delete.
-    pub fn object(mut self, key: impl Into<String>) -> Self {
-        self.objects.push(DeleteObjectIdentifier::new(key));
-        self
+    pub fn object(mut self, key: impl Into<String>) -> Result<Self> {
+        push_delete_object(&mut self.objects, DeleteObjectIdentifier::new(key)?)?;
+        Ok(self)
     }
 
     /// Adds an object key and version id to delete.
@@ -802,21 +823,22 @@ impl BlockingDeleteObjectsRequest {
         mut self,
         key: impl Into<String>,
         version_id: impl Into<String>,
-    ) -> Self {
-        self.objects
-            .push(DeleteObjectIdentifier::new(key).with_version_id(version_id));
-        self
+    ) -> Result<Self> {
+        let object = DeleteObjectIdentifier::new(key)?.with_version_id(version_id)?;
+        push_delete_object(&mut self.objects, object)?;
+        Ok(self)
     }
 
     /// Adds multiple object keys to delete.
-    pub fn objects<I, S>(mut self, iter: I) -> Self
+    pub fn objects<I, S>(mut self, iter: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.objects
-            .extend(iter.into_iter().map(DeleteObjectIdentifier::new));
-        self
+        for key in iter {
+            push_delete_object(&mut self.objects, DeleteObjectIdentifier::new(key)?)?;
+        }
+        Ok(self)
     }
 
     /// Toggles quiet response mode.
@@ -828,16 +850,7 @@ impl BlockingDeleteObjectsRequest {
     /// Sends the request.
     pub fn send(self) -> Result<DeleteObjectsOutput> {
         let body = crate::util::xml::encode_delete_objects(&self.objects, self.quiet)?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/xml"),
-        );
-        let content_md5 = crate::util::md5::content_md5_header_value(body.as_ref())?;
-        headers.insert(
-            http::header::HeaderName::from_static("content-md5"),
-            content_md5,
-        );
+        let headers = xml_body_headers(body.as_ref())?;
 
         let resp = self.client.execute(
             Method::POST,
@@ -871,9 +884,11 @@ pub struct BlockingCopyObjectRequest {
 
 impl BlockingCopyObjectRequest {
     /// Sets a source version id to copy.
-    pub fn source_version_id(mut self, version_id: impl Into<String>) -> Self {
-        self.source_version_id = Some(version_id.into());
-        self
+    pub fn source_version_id(mut self, version_id: impl Into<String>) -> Result<Self> {
+        let version_id = version_id.into();
+        crate::util::validation::validate_version_id(&version_id)?;
+        self.source_version_id = Some(version_id);
+        Ok(self)
     }
 
     /// Replaces metadata on the destination object.
@@ -883,15 +898,17 @@ impl BlockingCopyObjectRequest {
     }
 
     /// Adds a user metadata entry.
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.push((key.into(), value.into()));
-        self
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        push_metadata(&mut self.metadata, key, value)?;
+        Ok(self)
     }
 
     /// Sets the Content-Type for the destination object.
-    pub fn content_type(mut self, value: impl Into<String>) -> Self {
-        self.content_type = Some(value.into());
-        self
+    pub fn content_type(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Content-Type header")?;
+        self.content_type = Some(value);
+        Ok(self)
     }
 
     /// Sends the request.
@@ -947,15 +964,17 @@ pub struct BlockingCreateMultipartUploadRequest {
 #[cfg(feature = "multipart")]
 impl BlockingCreateMultipartUploadRequest {
     /// Sets the Content-Type header.
-    pub fn content_type(mut self, value: impl Into<String>) -> Self {
-        self.content_type = Some(value.into());
-        self
+    pub fn content_type(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_header_value(&value, "invalid Content-Type header")?;
+        self.content_type = Some(value);
+        Ok(self)
     }
 
     /// Adds a user metadata entry.
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.push((key.into(), value.into()));
-        self
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        push_metadata(&mut self.metadata, key, value)?;
+        Ok(self)
     }
 
     /// Sends the request.
@@ -1088,15 +1107,17 @@ pub struct BlockingUploadPartCopyRequest {
 #[cfg(feature = "multipart")]
 impl BlockingUploadPartCopyRequest {
     /// Sets the source version id to copy.
-    pub fn source_version_id(mut self, version_id: impl Into<String>) -> Self {
-        self.source_version_id = Some(version_id.into());
-        self
+    pub fn source_version_id(mut self, version_id: impl Into<String>) -> Result<Self> {
+        let version_id = version_id.into();
+        crate::util::validation::validate_version_id(&version_id)?;
+        self.source_version_id = Some(version_id);
+        Ok(self)
     }
 
     /// Sets a byte range for the copy source.
-    pub fn copy_source_range_bytes(mut self, start: u64, end_inclusive: u64) -> Self {
-        self.copy_source_range = Some(ByteRange::new(start, end_inclusive));
-        self
+    pub fn copy_source_range_bytes(mut self, start: u64, end_inclusive: u64) -> Result<Self> {
+        self.copy_source_range = Some(ByteRange::new(start, end_inclusive)?);
+        Ok(self)
     }
 
     /// Sends the request.
@@ -1160,21 +1181,20 @@ pub struct BlockingCompleteMultipartUploadRequest {
 #[cfg(feature = "multipart")]
 impl BlockingCompleteMultipartUploadRequest {
     /// Adds a completed part by number and etag.
-    pub fn part(mut self, part_number: u32, etag: impl Into<String>) -> Self {
-        self.parts.push(CompletedPart {
-            part_number,
-            etag: etag.into(),
-        });
-        self
+    pub fn part(mut self, part_number: u32, etag: impl Into<String>) -> Result<Self> {
+        push_completed_part(&mut self.parts, CompletedPart::new(part_number, etag)?)?;
+        Ok(self)
     }
 
     /// Adds multiple completed parts.
-    pub fn parts<I>(mut self, iter: I) -> Self
+    pub fn parts<I>(mut self, iter: I) -> Result<Self>
     where
         I: IntoIterator<Item = CompletedPart>,
     {
-        self.parts.extend(iter);
-        self
+        for part in iter {
+            push_completed_part(&mut self.parts, part)?;
+        }
+        Ok(self)
     }
 
     /// Sends the request.
@@ -1250,15 +1270,17 @@ pub struct BlockingListPartsRequest {
 #[cfg(feature = "multipart")]
 impl BlockingListPartsRequest {
     /// Sets the maximum number of parts to return.
-    pub fn max_parts(mut self, value: u32) -> Self {
+    pub fn max_parts(mut self, value: u32) -> Result<Self> {
+        validate_max_parts(value)?;
         self.max_parts = Some(value);
-        self
+        Ok(self)
     }
 
     /// Sets the part number marker for pagination.
-    pub fn part_number_marker(mut self, value: u32) -> Self {
+    pub fn part_number_marker(mut self, value: u32) -> Result<Self> {
+        validate_part_number_marker(value)?;
         self.part_number_marker = Some(value);
-        self
+        Ok(self)
     }
 
     /// Sends the request.
@@ -1310,8 +1332,8 @@ impl BlockingListPartsRequest {
 /// let page = client
 ///     .objects()
 ///     .list_v2("my-bucket")
-///     .prefix("logs/")
-///     .max_keys(100)
+///     .prefix("logs/")?
+///     .max_keys(100)?
 ///     .send()?;
 /// # let _ = page;
 /// # Ok(())
@@ -1329,33 +1351,42 @@ pub struct BlockingListObjectsV2Request {
 
 impl BlockingListObjectsV2Request {
     /// Filters by key prefix.
-    pub fn prefix(mut self, value: impl Into<String>) -> Self {
-        self.prefix = Some(value.into());
-        self
+    pub fn prefix(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_query_value("prefix", &value)?;
+        self.prefix = Some(value);
+        Ok(self)
     }
 
     /// Groups keys by delimiter.
-    pub fn delimiter(mut self, value: impl Into<String>) -> Self {
-        self.delimiter = Some(value.into());
-        self
+    pub fn delimiter(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_query_value("delimiter", &value)?;
+        self.delimiter = Some(value);
+        Ok(self)
     }
 
     /// Sets the continuation token for pagination.
-    pub fn continuation_token(mut self, value: impl Into<String>) -> Self {
-        self.continuation_token = Some(value.into());
-        self
+    pub fn continuation_token(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_query_token("continuation_token", &value)?;
+        self.continuation_token = Some(value);
+        Ok(self)
     }
 
     /// Starts listing after the given key.
-    pub fn start_after(mut self, value: impl Into<String>) -> Self {
-        self.start_after = Some(value.into());
-        self
+    pub fn start_after(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        crate::util::validation::validate_object_key(&value)?;
+        self.start_after = Some(value);
+        Ok(self)
     }
 
     /// Sets the maximum number of keys to return.
-    pub fn max_keys(mut self, value: u32) -> Self {
+    pub fn max_keys(mut self, value: u32) -> Result<Self> {
+        validate_max_keys(value)?;
         self.max_keys = Some(value);
-        self
+        Ok(self)
     }
 
     /// Converts this request into a pager.
@@ -1453,11 +1484,24 @@ impl Iterator for BlockingListObjectsV2Pager {
 
         match page {
             Ok(page) => {
-                self.continuation_token = page.next_continuation_token.clone();
-                if !page.is_truncated {
-                    self.done = true;
+                let next = next_list_v2_continuation_token(
+                    self.continuation_token.as_deref(),
+                    page.next_continuation_token.as_deref(),
+                    page.is_truncated,
+                );
+                match next {
+                    Ok(next) => {
+                        self.continuation_token = next;
+                        if self.continuation_token.is_none() {
+                            self.done = true;
+                        }
+                        Some(Ok(page))
+                    }
+                    Err(err) => {
+                        self.done = true;
+                        Some(Err(err))
+                    }
                 }
-                Some(Ok(page))
             }
             Err(err) => {
                 self.done = true;
@@ -1481,27 +1525,36 @@ pub struct BlockingPresignObjectRequest {
 
 impl BlockingPresignObjectRequest {
     /// Sets the expiry duration.
-    pub fn expires_in(mut self, duration: Duration) -> Self {
+    pub fn expires_in(mut self, duration: Duration) -> Result<Self> {
+        crate::util::signing::validate_presign_expires(duration)?;
         self.expires_in = duration;
-        self
+        Ok(self)
     }
 
     /// Adds a query parameter to the presigned URL.
-    pub fn query_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.query_params.push((name.into(), value.into()));
-        self
+    pub fn query_param(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let value = value.into();
+        crate::util::signing::validate_presign_query_param(&name, &value)?;
+        self.query_params.push((name, value));
+        Ok(self)
     }
 
     /// Adds an HTTP header to sign.
-    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Result<Self> {
+        crate::util::signing::validate_presign_header(&name, &value)?;
         self.headers.insert(name, value);
-        self
+        Ok(self)
     }
 
     /// Adds a user metadata entry to sign.
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.push((key.into(), value.into()));
-        self
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        push_metadata(&mut self.metadata, key, value)?;
+        Ok(self)
     }
 
     /// Builds the presigned request.
@@ -1540,7 +1593,7 @@ impl BlockingPresignObjectRequest {
 /// let presigned = client
 ///     .objects()
 ///     .presign_get("my-bucket", "reports/q1.csv")
-///     .expires_in(Duration::from_secs(300))
+///     .expires_in(Duration::from_secs(300))?
 ///     .build()?;
 /// # let _ = presigned;
 /// # Ok(())
@@ -1558,27 +1611,36 @@ pub struct BlockingPresignGetObjectRequest {
 
 impl BlockingPresignGetObjectRequest {
     /// Sets the expiry duration.
-    pub fn expires_in(mut self, duration: Duration) -> Self {
+    pub fn expires_in(mut self, duration: Duration) -> Result<Self> {
+        crate::util::signing::validate_presign_expires(duration)?;
         self.expires_in = duration;
-        self
+        Ok(self)
     }
 
     /// Adds a query parameter to the presigned URL.
-    pub fn query_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.query_params.push((name.into(), value.into()));
-        self
+    pub fn query_param(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let value = value.into();
+        crate::util::signing::validate_presign_query_param(&name, &value)?;
+        self.query_params.push((name, value));
+        Ok(self)
     }
 
     /// Adds an HTTP header to sign.
-    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Result<Self> {
+        crate::util::signing::validate_presign_header(&name, &value)?;
         self.headers.insert(name, value);
-        self
+        Ok(self)
     }
 
     /// Adds a user metadata entry to sign.
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.push((key.into(), value.into()));
-        self
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        push_metadata(&mut self.metadata, key, value)?;
+        Ok(self)
     }
 
     /// Builds the presigned request.
@@ -1610,27 +1672,36 @@ pub struct BlockingPresignPutObjectRequest {
 
 impl BlockingPresignPutObjectRequest {
     /// Sets the expiry duration.
-    pub fn expires_in(mut self, duration: Duration) -> Self {
+    pub fn expires_in(mut self, duration: Duration) -> Result<Self> {
+        crate::util::signing::validate_presign_expires(duration)?;
         self.expires_in = duration;
-        self
+        Ok(self)
     }
 
     /// Adds a query parameter to the presigned URL.
-    pub fn query_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.query_params.push((name.into(), value.into()));
-        self
+    pub fn query_param(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let value = value.into();
+        crate::util::signing::validate_presign_query_param(&name, &value)?;
+        self.query_params.push((name, value));
+        Ok(self)
     }
 
     /// Adds an HTTP header to sign.
-    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Result<Self> {
+        crate::util::signing::validate_presign_header(&name, &value)?;
         self.headers.insert(name, value);
-        self
+        Ok(self)
     }
 
     /// Adds a user metadata entry to sign.
-    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.metadata.push((key.into(), value.into()));
-        self
+    pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
+        push_metadata(&mut self.metadata, key, value)?;
+        Ok(self)
     }
 
     /// Builds the presigned request.
@@ -1661,21 +1732,30 @@ pub struct BlockingPresignHeadObjectRequest {
 
 impl BlockingPresignHeadObjectRequest {
     /// Sets the expiry duration.
-    pub fn expires_in(mut self, duration: Duration) -> Self {
+    pub fn expires_in(mut self, duration: Duration) -> Result<Self> {
+        crate::util::signing::validate_presign_expires(duration)?;
         self.expires_in = duration;
-        self
+        Ok(self)
     }
 
     /// Adds a query parameter to the presigned URL.
-    pub fn query_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.query_params.push((name.into(), value.into()));
-        self
+    pub fn query_param(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let value = value.into();
+        crate::util::signing::validate_presign_query_param(&name, &value)?;
+        self.query_params.push((name, value));
+        Ok(self)
     }
 
     /// Adds an HTTP header to sign.
-    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Result<Self> {
+        crate::util::signing::validate_presign_header(&name, &value)?;
         self.headers.insert(name, value);
-        self
+        Ok(self)
     }
 
     /// Builds the presigned request.
@@ -1703,21 +1783,30 @@ pub struct BlockingPresignDeleteObjectRequest {
 
 impl BlockingPresignDeleteObjectRequest {
     /// Sets the expiry duration.
-    pub fn expires_in(mut self, duration: Duration) -> Self {
+    pub fn expires_in(mut self, duration: Duration) -> Result<Self> {
+        crate::util::signing::validate_presign_expires(duration)?;
         self.expires_in = duration;
-        self
+        Ok(self)
     }
 
     /// Adds a query parameter to the presigned URL.
-    pub fn query_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.query_params.push((name.into(), value.into()));
-        self
+    pub fn query_param(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let value = value.into();
+        crate::util::signing::validate_presign_query_param(&name, &value)?;
+        self.query_params.push((name, value));
+        Ok(self)
     }
 
     /// Adds an HTTP header to sign.
-    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Self {
+    pub fn header(mut self, name: http::header::HeaderName, value: HeaderValue) -> Result<Self> {
+        crate::util::signing::validate_presign_header(&name, &value)?;
         self.headers.insert(name, value);
-        self
+        Ok(self)
     }
 
     /// Builds the presigned request.
@@ -1736,6 +1825,26 @@ impl BlockingPresignDeleteObjectRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_client() -> BlockingClient {
+        BlockingClient::builder("https://s3.example.com")
+            .expect("builder should parse")
+            .region("us-east-1")
+            .auth(crate::Auth::Anonymous)
+            .build()
+            .expect("client should build")
+    }
+
+    fn assert_invalid_config<T>(result: Result<T>, expected: &str) {
+        match result {
+            Err(Error::InvalidConfig { message }) => assert!(
+                message.contains(expected),
+                "expected {message:?} to contain {expected:?}"
+            ),
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig"),
+        }
+    }
 
     #[test]
     fn parse_xml_or_service_error_maps_error_xml_as_api_error() {
@@ -1784,6 +1893,194 @@ mod tests {
             Error::Decode { .. } => {}
             other => panic!("expected Decode error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_v2_setters_reject_invalid_values() {
+        let objects = test_client().objects();
+
+        assert_invalid_config(objects.list_v2("bucket").prefix(""), "prefix");
+        assert_invalid_config(objects.list_v2("bucket").delimiter(""), "delimiter");
+        assert_invalid_config(
+            objects.list_v2("bucket").continuation_token(" token"),
+            "continuation_token",
+        );
+        assert_invalid_config(
+            objects.list_v2("bucket").start_after("a/../b"),
+            "object key",
+        );
+        assert_invalid_config(objects.list_v2("bucket").max_keys(0), "max_keys");
+    }
+
+    #[test]
+    fn delete_objects_setters_reject_oversized_batches() {
+        let objects = test_client().objects();
+        let keys =
+            (0..=crate::types::MAX_DELETE_OBJECTS_PER_REQUEST).map(|idx| format!("key-{idx}"));
+
+        assert_invalid_config(
+            objects.delete_objects("bucket").objects(keys),
+            "at most 1000",
+        );
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn complete_multipart_setters_reject_duplicate_parts() {
+        let objects = test_client().objects();
+
+        assert_invalid_config(
+            objects
+                .complete_multipart_upload("bucket", "key", "upload-id")
+                .part(1, "\"etag-1\"")
+                .unwrap()
+                .part(1, "\"etag-duplicate\""),
+            "unique",
+        );
+        assert_invalid_config(
+            objects
+                .complete_multipart_upload("bucket", "key", "upload-id")
+                .parts(vec![
+                    CompletedPart::new(1, "\"etag-1\"").unwrap(),
+                    CompletedPart::new(1, "\"etag-duplicate\"").unwrap(),
+                ]),
+            "unique",
+        );
+    }
+
+    #[test]
+    fn copy_source_version_id_setters_reject_invalid_values() {
+        let objects = test_client().objects();
+
+        assert_invalid_config(
+            objects
+                .copy("source-bucket", "source-key", "bucket", "key")
+                .source_version_id(" version"),
+            "version_id",
+        );
+
+        #[cfg(feature = "multipart")]
+        assert_invalid_config(
+            objects
+                .upload_part_copy(
+                    "source-bucket",
+                    "source-key",
+                    "bucket",
+                    "key",
+                    "upload-id",
+                    1,
+                )
+                .source_version_id("version "),
+            "version_id",
+        );
+    }
+
+    #[test]
+    fn presign_setters_reject_invalid_values() {
+        let objects = test_client().objects();
+
+        assert_invalid_config(
+            objects
+                .presign_get("bucket", "key")
+                .expires_in(Duration::ZERO),
+            "expires_in",
+        );
+        assert_invalid_config(
+            objects
+                .presign_get("bucket", "key")
+                .query_param(" x", "value"),
+            "query parameter",
+        );
+        assert_invalid_config(
+            objects
+                .presign_get("bucket", "key")
+                .query_param("x-amz-user", "value"),
+            "reserved",
+        );
+        assert_invalid_config(
+            objects
+                .presign_get("bucket", "key")
+                .header(http::header::HOST, HeaderValue::from_static("example.com")),
+            "SigV4-managed",
+        );
+        assert_invalid_config(
+            objects.presign_get("bucket", "key").header(
+                http::header::HeaderName::from_static("x-amz-meta-bin"),
+                HeaderValue::from_bytes(&[0xff]).unwrap(),
+            ),
+            "header",
+        );
+    }
+
+    #[test]
+    fn header_and_metadata_setters_reject_invalid_values() {
+        let objects = test_client().objects();
+
+        assert_invalid_config(
+            objects.get("bucket", "key").if_match(" \"etag\""),
+            "If-Match",
+        );
+        assert_invalid_config(
+            objects.get("bucket", "key").if_none_match(""),
+            "If-None-Match",
+        );
+        assert_invalid_config(
+            objects.get("bucket", "key").if_modified_since(" date"),
+            "If-Modified-Since",
+        );
+        assert_invalid_config(
+            objects.get("bucket", "key").if_unmodified_since("date "),
+            "If-Unmodified-Since",
+        );
+        assert_invalid_config(
+            objects.put("bucket", "key").content_type(" text/plain"),
+            "Content-Type",
+        );
+        assert_invalid_config(
+            objects.put("bucket", "key").metadata("", "value"),
+            "metadata key",
+        );
+        assert_invalid_config(
+            objects
+                .put("bucket", "key")
+                .metadata("Trace", "a")
+                .unwrap()
+                .metadata("trace", "b"),
+            "unique",
+        );
+        assert_invalid_config(
+            objects
+                .copy("source-bucket", "source-key", "bucket", "key")
+                .content_type(""),
+            "Content-Type",
+        );
+
+        #[cfg(feature = "multipart")]
+        assert_invalid_config(
+            objects
+                .create_multipart_upload("bucket", "key")
+                .metadata("bad key", "value"),
+            "metadata key",
+        );
+    }
+
+    #[cfg(feature = "multipart")]
+    #[test]
+    fn list_parts_setters_reject_invalid_values() {
+        let objects = test_client().objects();
+
+        assert_invalid_config(
+            objects
+                .list_parts("bucket", "key", "upload-id")
+                .max_parts(0),
+            "max_parts",
+        );
+        assert_invalid_config(
+            objects
+                .list_parts("bucket", "key", "upload-id")
+                .part_number_marker(0),
+            "part_number_marker",
+        );
     }
 
     #[test]

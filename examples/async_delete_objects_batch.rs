@@ -51,14 +51,14 @@ async fn main() -> Result<(), s3::Error> {
     client
         .objects()
         .put(&bucket, &key1)
-        .content_type("text/plain")
+        .content_type("text/plain")?
         .body_bytes(b"one\n".to_vec())
         .send()
         .await?;
     client
         .objects()
         .put(&bucket, &key2)
-        .content_type("text/plain")
+        .content_type("text/plain")?
         .body_bytes(b"two\n".to_vec())
         .send()
         .await?;
@@ -66,7 +66,7 @@ async fn main() -> Result<(), s3::Error> {
     let out = client
         .objects()
         .delete_objects(&bucket)
-        .objects([key1.clone(), key2.clone()])
+        .objects([key1.clone(), key2.clone()])?
         .send()
         .await?;
 

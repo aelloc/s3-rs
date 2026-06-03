@@ -43,7 +43,7 @@ async fn main() -> Result<(), s3::Error> {
     let presigned = client
         .objects()
         .presign_get("my-bucket", "path/to/object.txt")
-        .expires_in(Duration::from_secs(300))
+        .expires_in(Duration::from_secs(300))?
         .build_async()
         .await?;
 
