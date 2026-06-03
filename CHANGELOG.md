@@ -1,8 +1,21 @@
+## [0.1.34] - 2026-06-03
+
+### 🚀 Features
+
+- [**breaking**] Validate request builders eagerly
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Update
 ## [0.1.33] - 2026-05-21
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release s3 version 0.1.33
 ## [0.1.32] - 2026-05-21
 
 ### 🐛 Bug Fixes
