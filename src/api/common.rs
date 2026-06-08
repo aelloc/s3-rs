@@ -95,6 +95,176 @@ pub(crate) fn insert_optional_header(
     Ok(())
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ObjectConditions {
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+}
+
+impl ObjectConditions {
+    pub(crate) fn set_if_match(&mut self, value: impl Into<String>) -> Result<()> {
+        let value = value.into();
+        validate_header_value(&value, "invalid If-Match header")?;
+        self.if_match = Some(value);
+        Ok(())
+    }
+
+    pub(crate) fn set_if_none_match(&mut self, value: impl Into<String>) -> Result<()> {
+        let value = value.into();
+        validate_header_value(&value, "invalid If-None-Match header")?;
+        self.if_none_match = Some(value);
+        Ok(())
+    }
+
+    pub(crate) fn apply(self, headers: &mut HeaderMap) -> Result<()> {
+        insert_optional_header(
+            headers,
+            http::header::IF_MATCH,
+            self.if_match,
+            "invalid If-Match header",
+        )?;
+        insert_optional_header(
+            headers,
+            http::header::IF_NONE_MATCH,
+            self.if_none_match,
+            "invalid If-None-Match header",
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PutObjectHeaders {
+    content_type: Option<String>,
+    cache_control: Option<String>,
+    content_disposition: Option<String>,
+    content_encoding: Option<String>,
+    content_language: Option<String>,
+    expires: Option<String>,
+    conditions: ObjectConditions,
+    metadata: Vec<(String, String)>,
+}
+
+impl PutObjectHeaders {
+    pub(crate) fn content_type(&mut self, value: impl Into<String>) -> Result<()> {
+        self.set_optional_header(value, "invalid Content-Type header", |headers, value| {
+            headers.content_type = Some(value);
+        })
+    }
+
+    pub(crate) fn cache_control(&mut self, value: impl Into<String>) -> Result<()> {
+        self.set_optional_header(value, "invalid Cache-Control header", |headers, value| {
+            headers.cache_control = Some(value);
+        })
+    }
+
+    pub(crate) fn content_disposition(&mut self, value: impl Into<String>) -> Result<()> {
+        self.set_optional_header(
+            value,
+            "invalid Content-Disposition header",
+            |headers, value| {
+                headers.content_disposition = Some(value);
+            },
+        )
+    }
+
+    pub(crate) fn content_encoding(&mut self, value: impl Into<String>) -> Result<()> {
+        self.set_optional_header(
+            value,
+            "invalid Content-Encoding header",
+            |headers, value| {
+                headers.content_encoding = Some(value);
+            },
+        )
+    }
+
+    pub(crate) fn content_language(&mut self, value: impl Into<String>) -> Result<()> {
+        self.set_optional_header(
+            value,
+            "invalid Content-Language header",
+            |headers, value| {
+                headers.content_language = Some(value);
+            },
+        )
+    }
+
+    pub(crate) fn expires(&mut self, value: impl Into<String>) -> Result<()> {
+        self.set_optional_header(value, "invalid Expires header", |headers, value| {
+            headers.expires = Some(value);
+        })
+    }
+
+    pub(crate) fn if_match(&mut self, value: impl Into<String>) -> Result<()> {
+        self.conditions.set_if_match(value)
+    }
+
+    pub(crate) fn if_none_match(&mut self, value: impl Into<String>) -> Result<()> {
+        self.conditions.set_if_none_match(value)
+    }
+
+    pub(crate) fn metadata(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<()> {
+        push_metadata(&mut self.metadata, key, value)
+    }
+
+    pub(crate) fn into_header_map(self) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_TYPE,
+            self.content_type,
+            "invalid Content-Type header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CACHE_CONTROL,
+            self.cache_control,
+            "invalid Cache-Control header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_DISPOSITION,
+            self.content_disposition,
+            "invalid Content-Disposition header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_ENCODING,
+            self.content_encoding,
+            "invalid Content-Encoding header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::CONTENT_LANGUAGE,
+            self.content_language,
+            "invalid Content-Language header",
+        )?;
+        insert_optional_header(
+            &mut headers,
+            http::header::EXPIRES,
+            self.expires,
+            "invalid Expires header",
+        )?;
+        self.conditions.apply(&mut headers)?;
+        apply_metadata_headers(&mut headers, self.metadata)?;
+        Ok(headers)
+    }
+
+    fn set_optional_header(
+        &mut self,
+        value: impl Into<String>,
+        invalid_message: &'static str,
+        set: impl FnOnce(&mut Self, String),
+    ) -> Result<()> {
+        let value = value.into();
+        validate_header_value(&value, invalid_message)?;
+        set(self, value);
+        Ok(())
+    }
+}
+
 pub(crate) fn xml_body_headers(body: &[u8]) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -573,6 +743,70 @@ mod tests {
                 other => panic!("expected InvalidConfig, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn object_conditions_apply_conditional_headers() {
+        let mut conditions = ObjectConditions::default();
+        conditions
+            .set_if_match("\"etag\"")
+            .expect("If-Match should be valid");
+        conditions
+            .set_if_none_match("*")
+            .expect("If-None-Match wildcard should be valid");
+
+        let mut headers = HeaderMap::new();
+        conditions
+            .apply(&mut headers)
+            .expect("headers should apply");
+
+        assert_eq!(
+            headers
+                .get(http::header::IF_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"etag\"")
+        );
+        assert_eq!(
+            headers
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn put_object_headers_include_conditions_and_metadata() {
+        let mut headers = PutObjectHeaders::default();
+        headers
+            .content_type("text/plain")
+            .expect("content type should be valid");
+        headers
+            .if_none_match("*")
+            .expect("If-None-Match wildcard should be valid");
+        headers
+            .metadata("lease-owner", "client-1")
+            .expect("metadata should be valid");
+
+        let headers = headers.into_header_map().expect("headers should be valid");
+
+        assert_eq!(
+            headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            headers
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert_eq!(
+            headers
+                .get("x-amz-meta-lease-owner")
+                .and_then(|value| value.to_str().ok()),
+            Some("client-1")
+        );
     }
 
     #[test]

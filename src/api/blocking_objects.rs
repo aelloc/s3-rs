@@ -10,10 +10,10 @@ use super::blocking_common::{parse_blocking_xml_response, read_response_error};
 #[cfg(test)]
 use super::common::parse_xml_or_service_error;
 use super::common::{
-    ByteRange, apply_copy_metadata_headers, apply_metadata_headers, insert_header,
-    insert_optional_header, next_list_v2_continuation_token, push_delete_object, push_metadata,
-    validate_content_length_matches_body, validate_header_value, validate_max_keys,
-    validate_query_token, validate_query_value, xml_body_headers,
+    ByteRange, ObjectConditions, PutObjectHeaders, apply_copy_metadata_headers,
+    apply_metadata_headers, insert_header, insert_optional_header, next_list_v2_continuation_token,
+    push_delete_object, push_metadata, validate_content_length_matches_body, validate_header_value,
+    validate_max_keys, validate_query_token, validate_query_value, xml_body_headers,
 };
 #[cfg(feature = "multipart")]
 use super::common::{
@@ -72,8 +72,7 @@ impl BlockingObjectsService {
             bucket: bucket.into(),
             key: key.into(),
             range: None,
-            if_match: None,
-            if_none_match: None,
+            conditions: ObjectConditions::default(),
             if_modified_since: None,
             if_unmodified_since: None,
         }
@@ -102,16 +101,10 @@ impl BlockingObjectsService {
             client: self.client.clone(),
             bucket: bucket.into(),
             key: key.into(),
-            content_type: None,
-            cache_control: None,
-            content_disposition: None,
-            content_encoding: None,
-            content_language: None,
-            expires: None,
+            headers: PutObjectHeaders::default(),
             content_length: None,
             #[cfg(feature = "checksums")]
             checksum: None,
-            metadata: Vec::new(),
             body: BlockingBody::Empty,
         }
     }
@@ -398,8 +391,7 @@ pub struct BlockingGetObjectRequest {
     bucket: String,
     key: String,
     range: Option<ByteRange>,
-    if_match: Option<String>,
-    if_none_match: Option<String>,
+    conditions: ObjectConditions,
     if_modified_since: Option<String>,
     if_unmodified_since: Option<String>,
 }
@@ -413,17 +405,13 @@ impl BlockingGetObjectRequest {
 
     /// Adds an If-Match condition.
     pub fn if_match(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid If-Match header")?;
-        self.if_match = Some(value);
+        self.conditions.set_if_match(value)?;
         Ok(self)
     }
 
     /// Adds an If-None-Match condition.
     pub fn if_none_match(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid If-None-Match header")?;
-        self.if_none_match = Some(value);
+        self.conditions.set_if_none_match(value)?;
         Ok(self)
     }
 
@@ -452,18 +440,7 @@ impl BlockingGetObjectRequest {
                 range.header_value("invalid Range header")?,
             );
         }
-        insert_optional_header(
-            &mut headers,
-            http::header::IF_MATCH,
-            self.if_match,
-            "invalid If-Match header",
-        )?;
-        insert_optional_header(
-            &mut headers,
-            http::header::IF_NONE_MATCH,
-            self.if_none_match,
-            "invalid If-None-Match header",
-        )?;
+        self.conditions.apply(&mut headers)?;
         insert_optional_header(
             &mut headers,
             http::header::IF_MODIFIED_SINCE,
@@ -578,65 +555,61 @@ pub struct BlockingPutObjectRequest {
     client: BlockingClient,
     bucket: String,
     key: String,
-    content_type: Option<String>,
-    cache_control: Option<String>,
-    content_disposition: Option<String>,
-    content_encoding: Option<String>,
-    content_language: Option<String>,
-    expires: Option<String>,
+    headers: PutObjectHeaders,
     content_length: Option<u64>,
     #[cfg(feature = "checksums")]
     checksum: Option<crate::types::Checksum>,
-    metadata: Vec<(String, String)>,
     body: BlockingBody,
 }
 
 impl BlockingPutObjectRequest {
     /// Sets the Content-Type header.
     pub fn content_type(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid Content-Type header")?;
-        self.content_type = Some(value);
+        self.headers.content_type(value)?;
         Ok(self)
     }
 
     /// Sets the Cache-Control header.
     pub fn cache_control(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid Cache-Control header")?;
-        self.cache_control = Some(value);
+        self.headers.cache_control(value)?;
         Ok(self)
     }
 
     /// Sets the Content-Disposition header.
     pub fn content_disposition(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid Content-Disposition header")?;
-        self.content_disposition = Some(value);
+        self.headers.content_disposition(value)?;
         Ok(self)
     }
 
     /// Sets the Content-Encoding header.
     pub fn content_encoding(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid Content-Encoding header")?;
-        self.content_encoding = Some(value);
+        self.headers.content_encoding(value)?;
         Ok(self)
     }
 
     /// Sets the Content-Language header.
     pub fn content_language(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid Content-Language header")?;
-        self.content_language = Some(value);
+        self.headers.content_language(value)?;
         Ok(self)
     }
 
     /// Sets the Expires header.
     pub fn expires(mut self, value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        validate_header_value(&value, "invalid Expires header")?;
-        self.expires = Some(value);
+        self.headers.expires(value)?;
+        Ok(self)
+    }
+
+    /// Adds an If-Match precondition.
+    pub fn if_match(mut self, value: impl Into<String>) -> Result<Self> {
+        self.headers.if_match(value)?;
+        Ok(self)
+    }
+
+    /// Adds an If-None-Match precondition.
+    ///
+    /// Use `*` for create-if-absent writes.
+    pub fn if_none_match(mut self, value: impl Into<String>) -> Result<Self> {
+        self.headers.if_none_match(value)?;
         Ok(self)
     }
 
@@ -648,7 +621,7 @@ impl BlockingPutObjectRequest {
 
     /// Adds a user metadata entry.
     pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Result<Self> {
-        push_metadata(&mut self.metadata, key, value)?;
+        self.headers.metadata(key, value)?;
         Ok(self)
     }
 
@@ -688,50 +661,16 @@ impl BlockingPutObjectRequest {
 
     /// Sends the request.
     pub fn send(self) -> Result<PutObjectOutput> {
-        let mut headers = HeaderMap::new();
-        insert_optional_header(
-            &mut headers,
-            http::header::CONTENT_TYPE,
-            self.content_type,
-            "invalid Content-Type header",
-        )?;
-        insert_optional_header(
-            &mut headers,
-            http::header::CACHE_CONTROL,
-            self.cache_control,
-            "invalid Cache-Control header",
-        )?;
-        insert_optional_header(
-            &mut headers,
-            http::header::CONTENT_DISPOSITION,
-            self.content_disposition,
-            "invalid Content-Disposition header",
-        )?;
-        insert_optional_header(
-            &mut headers,
-            http::header::CONTENT_ENCODING,
-            self.content_encoding,
-            "invalid Content-Encoding header",
-        )?;
-        insert_optional_header(
-            &mut headers,
-            http::header::CONTENT_LANGUAGE,
-            self.content_language,
-            "invalid Content-Language header",
-        )?;
-        insert_optional_header(
-            &mut headers,
-            http::header::EXPIRES,
-            self.expires,
-            "invalid Expires header",
-        )?;
-
-        apply_metadata_headers(&mut headers, self.metadata)?;
+        let headers = self.headers.into_header_map()?;
 
         #[cfg(feature = "checksums")]
-        if let Some(checksum) = self.checksum {
-            checksum.apply(&mut headers)?;
-        }
+        let headers = {
+            let mut headers = headers;
+            if let Some(checksum) = self.checksum {
+                checksum.apply(&mut headers)?;
+            }
+            headers
+        };
 
         let body = match self.body {
             BlockingBody::Empty => {
@@ -2037,6 +1976,14 @@ mod tests {
             "Content-Type",
         );
         assert_invalid_config(
+            objects.put("bucket", "key").if_match(" \"etag\""),
+            "If-Match",
+        );
+        assert_invalid_config(
+            objects.put("bucket", "key").if_none_match(""),
+            "If-None-Match",
+        );
+        assert_invalid_config(
             objects.put("bucket", "key").metadata("", "value"),
             "metadata key",
         );
@@ -2061,6 +2008,35 @@ mod tests {
                 .create_multipart_upload("bucket", "key")
                 .metadata("bad key", "value"),
             "metadata key",
+        );
+    }
+
+    #[test]
+    fn put_object_request_applies_conditional_headers() {
+        let request = test_client()
+            .objects()
+            .put("bucket", "locks/my-lock")
+            .if_none_match("*")
+            .expect("If-None-Match wildcard should be valid")
+            .if_match("\"etag\"")
+            .expect("If-Match should be valid");
+
+        let headers = request
+            .headers
+            .into_header_map()
+            .expect("headers should be valid");
+
+        assert_eq!(
+            headers
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert_eq!(
+            headers
+                .get(http::header::IF_MATCH)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"etag\"")
         );
     }
 
