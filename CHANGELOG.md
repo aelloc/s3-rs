@@ -1,3 +1,8 @@
+## [0.1.35] - 2026-06-08
+
+### 🚀 Features
+
+- *(objects)* Add conditional PutObject headers
 ## [0.1.34] - 2026-06-03
 
 ### 🚀 Features
@@ -7,6 +12,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Update
+- Release s3 version 0.1.34
 ## [0.1.33] - 2026-05-21
 
 ### 🐛 Bug Fixes
