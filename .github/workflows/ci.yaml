@@ -152,6 +152,7 @@ jobs:
       S3_TEST_REGION: us-east-1
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
+      MINIO_IMAGE: quay.io/minio/minio:latest
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -169,12 +170,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: Start MinIO
         run: |
+          set -euxo pipefail
+          docker rm -f minio || true
+          docker pull "$MINIO_IMAGE"
           docker run -d --name minio \
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             -e MINIO_DOMAIN=localhost \
-            minio/minio:latest server /data --console-address ":9001"
+            "$MINIO_IMAGE" server /data --console-address ":9001"
       - name: Wait for MinIO
         run: |
           for i in $(seq 1 60); do
@@ -184,6 +188,8 @@ jobs:
             sleep 1
           done
           echo "MinIO did not become ready in time" >&2
+          docker ps -a --filter name=minio >&2 || true
+          docker logs minio >&2 || true
           exit 1
       - name: Async integration
         run: cargo test --test s3_compat_async --features multipart
