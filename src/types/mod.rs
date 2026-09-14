@@ -641,7 +641,7 @@ pub struct BucketOwner {
 }
 
 /// Bucket listing entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Bucket {
     /// Bucket name.
     pub name: String,
